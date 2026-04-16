@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>YT Player</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#ff4444">
+
+  <!-- iOS PWA -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="YT Player">
+  <link rel="apple-touch-icon" href="icon-192.svg">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1><span>YT</span> Player</h1>
+  </div>
+
+  <!-- Banner instalación -->
+  <div class="install-banner">
+    <button class="close-banner" aria-label="Cerrar">✕</button>
+    <strong>Instalar como app:</strong><br>
+    Pulsa <strong>Compartir</strong> (↑) en Safari → <strong>"Añadir a pantalla de inicio"</strong>
+  </div>
+
+  <!-- Input -->
+  <div class="input-section">
+    <div class="input-row">
+      <input type="url" class="url-input" placeholder="Pega enlace de YouTube..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+      <button class="btn-paste" aria-label="Pegar">📋</button>
+    </div>
+    <button class="btn-play">Reproducir</button>
+  </div>
+
+  <!-- Status -->
+  <div class="status">
+    <span class="status-text"></span>
+  </div>
+
+  <!-- Resume Banner -->
+  <div class="resume-banner">
+    <span class="resume-text">Continuar desde 0:00</span>
+    <div class="resume-actions">
+      <button class="btn-restart">Desde el inicio</button>
+      <button class="btn-resume">Continuar</button>
+    </div>
+  </div>
+
+  <!-- Player -->
+  <div class="player-section">
+    <div class="player-wrap">
+      <div id="yt-player"></div>
+    </div>
+  </div>
+
+  <!-- Timer -->
+  <div class="timer-section">
+    <div class="timer-label">Temporizador</div>
+    <div class="timer-buttons">
+      <button class="timer-btn" data-timer="15">15m</button>
+      <button class="timer-btn" data-timer="30">30m</button>
+      <button class="timer-btn" data-timer="45">45m</button>
+      <button class="timer-btn" data-timer="60">1h</button>
+      <button class="timer-btn" data-timer="90">1.5h</button>
+      <button class="timer-btn timer-off active" data-timer="0">Off</button>
+    </div>
+    <div class="timer-countdown">
+      Se para en <span class="timer-countdown-time">0:00</span>
+    </div>
+  </div>
+
+  <!-- Historial -->
+  <div class="history-section">
+    <div class="history-title">Recientes</div>
+    <div class="history-list"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
