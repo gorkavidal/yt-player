@@ -42,6 +42,7 @@ function initDOM() {
   dom.ctrlPlay     = $('.ctrl-play');
   dom.ctrlFwd      = $('.ctrl-fwd');
   dom.ctrlNext     = $('.ctrl-next');
+  dom.ctrlFs       = $('.ctrl-fullscreen');
   dom.timerSection = $('.timer-section');
   dom.timerBtns    = $('.timer-buttons');
   dom.timerCountdown = $('.timer-countdown');
@@ -138,12 +139,9 @@ function stopSilentAudio() {
 // Fase 2: SW descarga del servidor al cache del móvil
 let downloadPollInterval = null;
 
-function startServerDownloadPolling(videoId) {
+// Polling no bloqueante: sigue el progreso del servidor y luego cachea en el móvil
+function waitForServerThenCacheOnDevice(videoId) {
   stopDownloadPolling();
-  dom.cacheStatus.textContent = 'Servidor preparando vídeo...';
-  dom.cacheStatus.classList.add('active');
-  dom.cacheStatus.classList.remove('cached');
-
   downloadPollInterval = setInterval(async () => {
     try {
       const res = await fetch(`/api/progress/${videoId}`);
@@ -151,10 +149,9 @@ function startServerDownloadPolling(videoId) {
 
       if (data.status === 'ready') {
         stopDownloadPolling();
-        // Fase 2: cachear en el móvil
         startDeviceCache(videoId);
       } else if (data.status === 'downloading') {
-        dom.cacheStatus.textContent = `Servidor: descargando ${data.progress}%`;
+        dom.cacheStatus.textContent = `Servidor: ${data.progress}%`;
       }
     } catch {
       stopDownloadPolling();
@@ -190,9 +187,12 @@ function setupSwMessages() {
       if (msg.percent >= 100) {
         dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
         dom.cacheStatus.classList.add('cached');
+        renderHistory(); // actualizar badge offline en historial
       } else {
         dom.cacheStatus.textContent = `Guardando en móvil... ${msg.percent}%`;
       }
+    } else if (msg.type === 'DEVICE_CACHE_EVICTED') {
+      renderHistory(); // actualizar badges
     } else if (msg.type === 'DEVICE_CACHE_ERROR') {
       dom.cacheStatus.textContent = 'Error al guardar en móvil';
       setTimeout(() => dom.cacheStatus.classList.remove('active'), 3000);
@@ -250,17 +250,23 @@ function setupVideoEvents() {
   });
 
   v.addEventListener('error', async () => {
+    const err = v.error;
+    const code = err ? err.code : '?';
+    const msg = err ? err.message : 'desconocido';
+    console.error('Video error:', code, msg, v.src);
+
     if (!state.hasRetried && state.videoId) {
       state.hasRetried = true;
-      setStatus('Reintentando...', '');
+      setStatus(`Reintentando... (error ${code})`, '');
       try {
         await fetch(`/api/info/${state.videoId}?refresh=1`);
-        v.src = `/api/stream/${state.videoId}?t=${Date.now()}`;
+        v.src = `/api/stream/${state.videoId}`;
+        v.load();
         await v.play();
         return;
       } catch {}
     }
-    setStatus('Error de reproducción', 'error');
+    setStatus(`Error: ${msg} (código ${code})`, 'error');
     setButtonLoading(false);
   });
 
@@ -298,6 +304,41 @@ function seekRelative(delta) {
   const v = dom.video;
   if (!v || !v.duration) return;
   v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + delta));
+}
+
+function toggleFullscreen() {
+  const v = dom.video;
+  if (!v) return;
+  // iOS Safari usa webkitEnterFullscreen en el <video>
+  if (v.webkitEnterFullscreen) {
+    v.webkitEnterFullscreen();
+  } else if (v.requestFullscreen) {
+    v.requestFullscreen();
+  } else if (v.webkitRequestFullscreen) {
+    v.webkitRequestFullscreen();
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// GESTIÓN DE CACHE (consultar/borrar vídeos individuales)
+// ═══════════════════════════════════════════════════════
+
+async function isVideoCachedOnDevice(videoId) {
+  if (!('caches' in window)) return false;
+  try {
+    const cache = await caches.open('yt-video-v1');
+    const match = await cache.match(`/api/stream/${videoId}`);
+    return !!match;
+  } catch { return false; }
+}
+
+async function deleteCachedVideo(videoId) {
+  if (!('caches' in window)) return;
+  try {
+    const cache = await caches.open('yt-video-v1');
+    await cache.delete(`/api/stream/${videoId}`);
+  } catch {}
+  renderHistory();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -341,10 +382,18 @@ async function playVideo(videoId, startTime) {
     dom.timeCur.textContent = formatTime(startTime || 0);
     dom.progress.style.setProperty('--fill', '0%');
 
-    // Cargar vídeo
     const v = dom.video;
-    v.src = `/api/stream/${videoId}`;
     v.poster = info.thumb;
+
+    if (!info.cached) {
+      // Pedir descarga al servidor en background
+      fetch(`/api/download/${videoId}`).catch(() => {});
+    }
+
+    // Poner src inmediatamente (el servidor espera si aún está descargando)
+    // Esto mantiene la cadena de gesto de usuario para que iOS permita play()
+    v.src = `/api/stream/${videoId}`;
+    setStatus('Cargando vídeo...');
 
     if (startTime && startTime > 0) {
       await new Promise(r => {
@@ -355,21 +404,22 @@ async function playVideo(videoId, startTime) {
       });
     }
 
-    await v.play();
+    // play() en contexto de gesto — iOS lo permite
+    v.play().catch(() => {});
+
+    // Mostrar progreso del servidor si aún está descargando
+    if (!info.cached) {
+      dom.cacheStatus.textContent = 'Servidor descargando...';
+      dom.cacheStatus.classList.add('active');
+      waitForServerThenCacheOnDevice(videoId);
+    } else {
+      // Ya en servidor, cachear en móvil directamente
+      dom.cacheStatus.classList.add('active');
+      startDeviceCache(videoId);
+    }
 
     setupMediaSession(info);
     addToHistory(videoId, info.title, info.author);
-    setStatus(info.title, 'success');
-
-    // Fase 1: si el servidor ya lo tiene, pasar directo a cache del móvil
-    if (info.cached) {
-      dom.cacheStatus.classList.add('active');
-      startDeviceCache(videoId);
-    } else {
-      // Pedir al servidor que descargue, luego cacheará en el móvil
-      fetch(`/api/download/${videoId}`).catch(() => {});
-      startServerDownloadPolling(videoId);
-    }
   } catch (err) {
     console.error('Error:', err);
     setStatus(err.message || 'Error al cargar', 'error');
@@ -535,7 +585,7 @@ function removeFromHistory(videoId) {
   renderHistory();
 }
 
-function renderHistory() {
+async function renderHistory() {
   if (state.history.length === 0) {
     dom.historyList.innerHTML = `
       <div class="empty-state">
@@ -545,16 +595,24 @@ function renderHistory() {
     return;
   }
 
-  dom.historyList.innerHTML = state.history.map(h => {
+  // Comprobar qué vídeos están cacheados en el dispositivo
+  const cacheChecks = await Promise.all(
+    state.history.map(h => isVideoCachedOnDevice(h.id))
+  );
+
+  dom.historyList.innerHTML = state.history.map((h, i) => {
     const saved = getSavedPosition(h.id);
-    const badge = saved && saved.time > 5
+    const posBadge = saved && saved.time > 5
       ? `<span class="history-badge">${formatTime(saved.time)}</span>` : '';
+    const cached = cacheChecks[i];
+    const cacheBadge = cached
+      ? `<span class="cache-badge" data-uncache="${h.id}">offline ✕</span>` : '';
     return `
       <div class="history-item" data-id="${h.id}">
         <img class="history-thumb" src="${h.thumb}" alt="" loading="lazy">
         <div class="history-info">
           <div class="history-info-title">${escapeHtml(h.title)}</div>
-          <div class="history-info-author">${escapeHtml(h.author)}${badge}</div>
+          <div class="history-info-author">${escapeHtml(h.author)}${posBadge}${cacheBadge}</div>
         </div>
         <button class="history-delete" data-delete="${h.id}" aria-label="Eliminar">✕</button>
       </div>`;
@@ -633,6 +691,7 @@ function init() {
   dom.ctrlFwd.addEventListener('click', () => seekRelative(15));
   dom.ctrlPrev.addEventListener('click', () => playPrevFromHistory());
   dom.ctrlNext.addEventListener('click', () => playNextFromHistory());
+  dom.ctrlFs.addEventListener('click', toggleFullscreen);
 
   // Progress bar
   dom.progress.addEventListener('input', () => {
@@ -656,6 +715,8 @@ function init() {
 
   // Historial
   dom.historyList.addEventListener('click', e => {
+    const uncache = e.target.closest('[data-uncache]');
+    if (uncache) { e.stopPropagation(); deleteCachedVideo(uncache.dataset.uncache); return; }
     const del = e.target.closest('[data-delete]');
     if (del) { e.stopPropagation(); removeFromHistory(del.dataset.delete); return; }
     const item = e.target.closest('.history-item');

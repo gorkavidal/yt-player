@@ -59,24 +59,30 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// ── Stream handler: cache-first con soporte Range ───
+// ── Stream handler: network-first, cache-fallback ───
+// Mientras hay red, usa el servidor (más eficiente con Range).
+// Sin red, sirve desde el cache local del móvil.
 async function handleStreamRequest(request, url) {
+  try {
+    const response = await fetch(request);
+    if (response.ok || response.status === 206) return response;
+  } catch {
+    // Sin red → intentar cache
+  }
+
+  // Fallback: cache del dispositivo
   const cache = await caches.open(CACHE_VIDEO);
-  // Clave canónica sin Range (el blob entero)
   const cacheKey = new Request(url.pathname, { method: 'GET' });
   const cached = await cache.match(cacheKey);
 
   if (cached) {
-    // Servir desde cache local del móvil
     return serveFromCache(cached, request);
   }
 
-  // No está en cache → pasar al servidor
-  try {
-    return await fetch(request);
-  } catch {
-    return new Response('Sin conexión y vídeo no cacheado', { status: 503 });
-  }
+  return new Response('Sin conexión y vídeo no cacheado', {
+    status: 503,
+    headers: { 'Content-Type': 'text/plain' }
+  });
 }
 
 // Servir un blob cacheado respondiendo a Range requests
@@ -91,13 +97,14 @@ async function serveFromCache(cachedResponse, originalRequest) {
     if (m) {
       const start = parseInt(m[1], 10);
       const end = m[2] ? parseInt(m[2], 10) : totalSize - 1;
-      const chunk = blob.slice(start, end + 1);
+      const clampedEnd = Math.min(end, totalSize - 1);
+      const chunk = blob.slice(start, clampedEnd + 1);
       return new Response(chunk, {
         status: 206,
         headers: {
           'Content-Type': contentType,
-          'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-          'Content-Length': chunk.size,
+          'Content-Range': `bytes ${start}-${clampedEnd}/${totalSize}`,
+          'Content-Length': String(chunk.size),
           'Accept-Ranges': 'bytes'
         }
       });
@@ -108,7 +115,7 @@ async function serveFromCache(cachedResponse, originalRequest) {
     status: 200,
     headers: {
       'Content-Type': contentType,
-      'Content-Length': totalSize,
+      'Content-Length': String(totalSize),
       'Accept-Ranges': 'bytes'
     }
   });
@@ -134,12 +141,6 @@ async function cacheVideoOnDevice(videoId, streamUrl) {
       return;
     }
 
-    // Borrar vídeos anteriores del cache del móvil
-    const keys = await cache.keys();
-    for (const req of keys) {
-      await cache.delete(req);
-    }
-
     // Descargar el vídeo entero al móvil (sin Range header)
     notifyClients({ type: 'DEVICE_CACHE_PROGRESS', videoId, percent: 0 });
 
@@ -152,9 +153,7 @@ async function cacheVideoOnDevice(videoId, streamUrl) {
     if (!response.body) {
       // Fallback sin ReadableStream
       const blob = await response.blob();
-      await cache.put(cacheKey, new Response(blob, {
-        headers: { 'Content-Type': contentType, 'Content-Length': blob.size }
-      }));
+      await putWithEviction(cache, cacheKey, blob, contentType, videoId);
       notifyClients({ type: 'DEVICE_CACHE_PROGRESS', videoId, percent: 100 });
       return;
     }
@@ -181,14 +180,45 @@ async function cacheVideoOnDevice(videoId, streamUrl) {
     }
 
     const blob = new Blob(chunks, { type: contentType });
-    await cache.put(cacheKey, new Response(blob, {
-      headers: { 'Content-Type': contentType, 'Content-Length': blob.size }
-    }));
+    await putWithEviction(cache, cacheKey, blob, contentType, videoId);
 
     notifyClients({ type: 'DEVICE_CACHE_PROGRESS', videoId, percent: 100 });
   } catch (e) {
     console.error('[SW] Error cacheando en dispositivo:', e);
     notifyClients({ type: 'DEVICE_CACHE_ERROR', videoId, error: e.message });
+  }
+}
+
+// Intentar guardar en cache; si falla por espacio, borrar el más viejo y reintentar
+async function putWithEviction(cache, cacheKey, blob, contentType, videoId) {
+  const makeResponse = () => new Response(blob, {
+    headers: { 'Content-Type': contentType, 'Content-Length': String(blob.size) }
+  });
+
+  try {
+    await cache.put(cacheKey, makeResponse());
+  } catch (e) {
+    // Probablemente QuotaExceededError — borrar el más viejo
+    const keys = await cache.keys();
+    // El más viejo es el primero añadido (orden de inserción)
+    for (const oldKey of keys) {
+      const oldUrl = new URL(oldKey.url);
+      // No borrar el que estamos intentando guardar
+      if (oldUrl.pathname === cacheKey.url || oldUrl.pathname === `/api/stream/${videoId}`) continue;
+      await cache.delete(oldKey);
+      const oldId = oldUrl.pathname.split('/api/stream/')[1];
+      if (oldId) notifyClients({ type: 'DEVICE_CACHE_EVICTED', videoId: oldId });
+      // Reintentar
+      try {
+        await cache.put(cacheKey, makeResponse());
+        return;
+      } catch {
+        // Seguir borrando más
+        continue;
+      }
+    }
+    // Si aún falla tras borrar todo, propagar el error
+    throw e;
   }
 }
 

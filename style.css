@@ -339,6 +339,21 @@ body {
   background: var(--accent-dim);
 }
 
+/* Secondary controls */
+.player-controls-secondary {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.ctrl-fullscreen {
+  font-size: 20px;
+  width: 44px;
+  height: 44px;
+  background: var(--surface);
+  border-radius: 50%;
+}
+
 /* ── Timer ── */
 .timer-section {
   display: none;
@@ -491,6 +506,11 @@ body {
   padding: 2px 6px;
   border-radius: 4px;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.cache-badge:active {
+  opacity: 0.6;
 }
 
 .history-delete {

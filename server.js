@@ -66,7 +66,7 @@ function downloadVideo(videoId) {
   const state = { progress: 0 };
 
   const promise = new Promise((resolve, reject) => {
-    // Limpiar vídeos anteriores para no llenar disco
+    // Limpiar vídeos anteriores del servidor (solo 1 en disco)
     try {
       const files = fs.readdirSync(VIDEOS_DIR);
       for (const f of files) {
@@ -77,7 +77,7 @@ function downloadVideo(videoId) {
     } catch {}
 
     const proc = spawn('yt-dlp', [
-      '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]',
+      '-f', 'bestvideo[height<=720][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720][vcodec^=avc1]',
       '--merge-output-format', 'mp4',
       '--no-playlist', '--no-warnings',
       '--newline',           // progreso línea a línea
