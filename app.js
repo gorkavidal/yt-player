@@ -133,12 +133,14 @@ function stopSilentAudio() {
 // CACHE DE VÍDEO (comunicación con Service Worker)
 // ═══════════════════════════════════════════════════════
 
-// Polling de progreso de descarga del servidor
+// ── Cache en dos fases ──────────────────────────────
+// Fase 1: servidor descarga con yt-dlp (polling /api/progress)
+// Fase 2: SW descarga del servidor al cache del móvil
 let downloadPollInterval = null;
 
-function startDownloadPolling(videoId) {
+function startServerDownloadPolling(videoId) {
   stopDownloadPolling();
-  dom.cacheStatus.textContent = 'Descargando vídeo...';
+  dom.cacheStatus.textContent = 'Servidor preparando vídeo...';
   dom.cacheStatus.classList.add('active');
   dom.cacheStatus.classList.remove('cached');
 
@@ -148,18 +150,13 @@ function startDownloadPolling(videoId) {
       const data = await res.json();
 
       if (data.status === 'ready') {
-        dom.cacheStatus.textContent = 'Vídeo descargado (disponible offline)';
-        dom.cacheStatus.classList.add('cached');
         stopDownloadPolling();
+        // Fase 2: cachear en el móvil
+        startDeviceCache(videoId);
       } else if (data.status === 'downloading') {
-        dom.cacheStatus.textContent = `Descargando... ${data.progress}%`;
-      } else {
-        dom.cacheStatus.textContent = '';
-        dom.cacheStatus.classList.remove('active');
-        stopDownloadPolling();
+        dom.cacheStatus.textContent = `Servidor: descargando ${data.progress}%`;
       }
     } catch {
-      // Sin conexión, dejar de pedir
       stopDownloadPolling();
     }
   }, 1500);
@@ -170,6 +167,37 @@ function stopDownloadPolling() {
     clearInterval(downloadPollInterval);
     downloadPollInterval = null;
   }
+}
+
+function startDeviceCache(videoId) {
+  if (!navigator.serviceWorker || !navigator.serviceWorker.controller) {
+    dom.cacheStatus.textContent = 'Listo (sin cache offline)';
+    return;
+  }
+  dom.cacheStatus.textContent = 'Guardando en móvil...';
+  navigator.serviceWorker.controller.postMessage({
+    type: 'CACHE_VIDEO',
+    videoId: videoId,
+    url: `/api/stream/${videoId}`
+  });
+}
+
+function setupSwMessages() {
+  if (!navigator.serviceWorker) return;
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (msg.type === 'DEVICE_CACHE_PROGRESS') {
+      if (msg.percent >= 100) {
+        dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
+        dom.cacheStatus.classList.add('cached');
+      } else {
+        dom.cacheStatus.textContent = `Guardando en móvil... ${msg.percent}%`;
+      }
+    } else if (msg.type === 'DEVICE_CACHE_ERROR') {
+      dom.cacheStatus.textContent = 'Error al guardar en móvil';
+      setTimeout(() => dom.cacheStatus.classList.remove('active'), 3000);
+    }
+  });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -333,14 +361,14 @@ async function playVideo(videoId, startTime) {
     addToHistory(videoId, info.title, info.author);
     setStatus(info.title, 'success');
 
-    // Si el servidor indica que ya está cacheado
+    // Fase 1: si el servidor ya lo tiene, pasar directo a cache del móvil
     if (info.cached) {
-      dom.cacheStatus.textContent = 'Vídeo descargado (disponible offline)';
-      dom.cacheStatus.classList.add('active', 'cached');
+      dom.cacheStatus.classList.add('active');
+      startDeviceCache(videoId);
     } else {
-      // Pedir descarga y seguir progreso
+      // Pedir al servidor que descargue, luego cacheará en el móvil
       fetch(`/api/download/${videoId}`).catch(() => {});
-      startDownloadPolling(videoId);
+      startServerDownloadPolling(videoId);
     }
   } catch (err) {
     console.error('Error:', err);
@@ -584,6 +612,7 @@ function setupVisibilityHandler() {
 function init() {
   initDOM();
   setupVideoEvents();
+  setupSwMessages();
 
   dom.btnPaste.addEventListener('click', pasteFromClipboard);
   dom.btnPlay.addEventListener('click', handlePlayRequest);
