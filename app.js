@@ -1,53 +1,59 @@
 // ═══════════════════════════════════════════════════════
-// YT Player – YouTube embebido en PWA
+// YT Player – Vídeo nativo con cache offline
 //
-// - Embed estándar de YouTube (IFrame Player API)
-// - Audio silencioso nativo para mantener sesión de audio
-//   activa en PWA standalone (iOS no suspende el WebView)
-// - Temporizador de apagado (sleep timer)
-// - Guardado automático de posición de reproducción
+// Usa yt-dlp en el servidor para obtener el stream MP4,
+// <video> nativo para reproducir, y Service Worker para
+// cachear el vídeo completo y reproducir sin conexión.
 // ═══════════════════════════════════════════════════════
 
 // ─── Estado ───
 const state = {
   videoId: null,
-  player: null,
-  playerReady: false,
-  silentAudio: null,     // <audio> silencioso para mantener sesión iOS
+  info: null,
+  isPlaying: false,
+  isSeeking: false,
+  hasRetried: false,
+  silentAudio: null,
   history: JSON.parse(localStorage.getItem('yt-history') || '[]'),
-  // Timer
-  timerMinutes: 0,
-  timerEnd: null,        // timestamp de fin
+  timerEnd: null,
   timerInterval: null,
-  // Posición
   positionInterval: null
 };
 
 // ─── DOM ───
-const $ = (sel) => document.querySelector(sel);
+const $ = sel => document.querySelector(sel);
 const dom = {};
 
 function initDOM() {
-  dom.urlInput = $('.url-input');
-  dom.btnPaste = $('.btn-paste');
-  dom.btnPlay = $('.btn-play');
-  dom.statusText = $('.status-text');
-  dom.playerSection = $('.player-section');
-  dom.playerWrap = $('.player-wrap');
-  dom.historyList = $('.history-list');
-  dom.installBanner = $('.install-banner');
-  dom.closeBanner = $('.close-banner');
-  // Timer
+  dom.urlInput     = $('.url-input');
+  dom.btnPaste     = $('.btn-paste');
+  dom.btnPlay      = $('.btn-play');
+  dom.statusText   = $('.status-text');
+  dom.player       = $('.player-section');
+  dom.video        = $('.player-video');
+  dom.title        = $('.player-title');
+  dom.author       = $('.player-author');
+  dom.cacheStatus  = $('.cache-status');
+  dom.progress     = $('.progress-bar');
+  dom.timeCur      = $('.time-current');
+  dom.timeDur      = $('.time-duration');
+  dom.ctrlPrev     = $('.ctrl-prev');
+  dom.ctrlBack     = $('.ctrl-back');
+  dom.ctrlPlay     = $('.ctrl-play');
+  dom.ctrlFwd      = $('.ctrl-fwd');
+  dom.ctrlNext     = $('.ctrl-next');
   dom.timerSection = $('.timer-section');
-  dom.timerButtons = $('.timer-buttons');
+  dom.timerBtns    = $('.timer-buttons');
   dom.timerCountdown = $('.timer-countdown');
-  dom.timerCountdownTime = $('.timer-countdown-time');
-  dom.timerOff = $('.timer-off');
-  // Resume
-  dom.resumeBanner = $('.resume-banner');
-  dom.resumeText = $('.resume-text');
-  dom.btnResume = $('.btn-resume');
-  dom.btnRestart = $('.btn-restart');
+  dom.timerTime    = $('.timer-countdown-time');
+  dom.timerOff     = $('.timer-off');
+  dom.resume       = $('.resume-banner');
+  dom.resumeText   = $('.resume-text');
+  dom.btnResume    = $('.btn-resume');
+  dom.btnRestart   = $('.btn-restart');
+  dom.historyList  = $('.history-list');
+  dom.installBanner = $('.install-banner');
+  dom.closeBanner  = $('.close-banner');
 }
 
 // ─── Utilidades ───
@@ -56,26 +62,27 @@ function extractVideoId(url) {
   url = url.trim();
   let m;
   if ((m = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/))) return m[1];
-  if ((m = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/))) return m[1];
-  if ((m = url.match(/embed\/([a-zA-Z0-9_-]{11})/))) return m[1];
-  if ((m = url.match(/shorts\/([a-zA-Z0-9_-]{11})/))) return m[1];
+  if ((m = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/)))      return m[1];
+  if ((m = url.match(/embed\/([a-zA-Z0-9_-]{11})/)))      return m[1];
+  if ((m = url.match(/shorts\/([a-zA-Z0-9_-]{11})/)))     return m[1];
   if (/^[a-zA-Z0-9_-]{11}$/.test(url)) return url;
   return null;
 }
 
-function escapeHtml(text) {
+function escapeHtml(t) {
   const d = document.createElement('div');
-  d.textContent = text;
+  d.textContent = t;
   return d.innerHTML;
 }
 
-function formatTime(seconds) {
-  if (!seconds || isNaN(seconds)) return '0:00';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  return `${m}:${s.toString().padStart(2, '0')}`;
+function formatTime(s) {
+  if (!s || isNaN(s)) return '0:00';
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
 function setStatus(text, type = '') {
@@ -83,161 +90,186 @@ function setStatus(text, type = '') {
   dom.statusText.className = 'status-text' + (type ? ' ' + type : '');
 }
 
-function setButtonLoading(loading) {
-  dom.btnPlay.disabled = loading;
-  dom.btnPlay.innerHTML = loading
+function setButtonLoading(on) {
+  dom.btnPlay.disabled = on;
+  dom.btnPlay.innerHTML = on
     ? '<span class="spinner"></span> Cargando...'
     : 'Reproducir';
 }
 
 // ═══════════════════════════════════════════════════════
-// AUDIO SILENCIOSO - Mantiene la sesión de audio en iOS
+// AUDIO SILENCIOSO – Mantiene sesión activa en iOS
 // ═══════════════════════════════════════════════════════
-// En PWA standalone, iOS suspende el WebView al bloquear
-// la pantalla. Un <audio> nativo reproduciéndose mantiene
-// la sesión activa y el iframe de YouTube sigue sonando.
 
 function generateSilentWav() {
-  const sampleRate = 8000;
-  const seconds = 1;
-  const numSamples = sampleRate * seconds;
-  const buffer = new ArrayBuffer(44 + numSamples);
-  const view = new DataView(buffer);
-
-  const writeStr = (offset, str) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + numSamples, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);   // chunk size
-  view.setUint16(20, 1, true);    // PCM
-  view.setUint16(22, 1, true);    // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate, true);
-  view.setUint16(32, 1, true);    // block align
-  view.setUint16(34, 8, true);    // 8 bits per sample
-  writeStr(36, 'data');
-  view.setUint32(40, numSamples, true);
-
-  // Silencio: 128 = punto medio en audio unsigned 8-bit
-  for (let i = 44; i < 44 + numSamples; i++) {
-    view.setUint8(i, 128);
-  }
-
-  const blob = new Blob([buffer], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
+  const rate = 8000, len = rate;
+  const buf = new ArrayBuffer(44 + len);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + len, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true);
+  v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  w(36, 'data'); v.setUint32(40, len, true);
+  for (let i = 44; i < 44 + len; i++) v.setUint8(i, 128);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 
 function startSilentAudio() {
-  if (state.silentAudio) return; // ya activo
-
-  const url = generateSilentWav();
-  const audio = new Audio(url);
-  audio.loop = true;
-  audio.volume = 0.01; // Casi inaudible pero >0 (iOS ignora volume=0)
-  audio.setAttribute('playsinline', '');
-  audio.setAttribute('webkit-playsinline', '');
-
-  audio.play().then(() => {
-    console.log('Sesión de audio silencioso activa');
-  }).catch((e) => {
-    console.warn('No se pudo iniciar audio silencioso:', e);
-  });
-
-  state.silentAudio = audio;
+  if (state.silentAudio) return;
+  const a = new Audio(generateSilentWav());
+  a.loop = true;
+  a.volume = 0.01;
+  a.setAttribute('playsinline', '');
+  a.play().catch(() => {});
+  state.silentAudio = a;
 }
 
 function stopSilentAudio() {
-  if (state.silentAudio) {
-    state.silentAudio.pause();
-    state.silentAudio = null;
-  }
+  if (state.silentAudio) { state.silentAudio.pause(); state.silentAudio = null; }
 }
 
 // ═══════════════════════════════════════════════════════
-// YOUTUBE IFRAME PLAYER
+// CACHE DE VÍDEO (comunicación con Service Worker)
 // ═══════════════════════════════════════════════════════
 
-function loadYouTubeAPI() {
-  return new Promise((resolve) => {
-    if (window.YT && window.YT.Player) { resolve(); return; }
-    window.onYouTubeIframeAPIReady = resolve;
-    const tag = document.createElement('script');
-    tag.src = 'https://www.youtube.com/iframe_api';
-    document.head.appendChild(tag);
-  });
-}
+// Polling de progreso de descarga del servidor
+let downloadPollInterval = null;
 
-function createPlayer(videoId, startTime) {
-  if (state.player) {
-    try { state.player.destroy(); } catch {}
-    state.player = null;
-    state.playerReady = false;
-  }
+function startDownloadPolling(videoId) {
+  stopDownloadPolling();
+  dom.cacheStatus.textContent = 'Descargando vídeo...';
+  dom.cacheStatus.classList.add('active');
+  dom.cacheStatus.classList.remove('cached');
 
-  dom.playerWrap.innerHTML = '<div id="yt-player"></div>';
+  downloadPollInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/progress/${videoId}`);
+      const data = await res.json();
 
-  return new Promise((resolve) => {
-    state.player = new YT.Player('yt-player', {
-      videoId: videoId,
-      host: 'https://www.youtube-nocookie.com',
-      playerVars: {
-        autoplay: 1,
-        playsinline: 1,
-        modestbranding: 1,
-        rel: 0,
-        fs: 1,
-        iv_load_policy: 3,
-        start: startTime ? Math.floor(startTime) : undefined,
-        origin: location.origin
-      },
-      events: {
-        onReady: (event) => {
-          state.playerReady = true;
-          setupMediaSession(event.target);
-          resolve(event.target);
-        },
-        onStateChange: onPlayerStateChange,
-        onError: (event) => {
-          const errors = {
-            2: 'ID de vídeo no válido',
-            5: 'Error del reproductor HTML5',
-            100: 'Vídeo no encontrado o privado',
-            101: 'No permite reproducción embebida',
-            150: 'No permite reproducción embebida'
-          };
-          setStatus(errors[event.data] || `Error (${event.data})`, 'error');
-        }
+      if (data.status === 'ready') {
+        dom.cacheStatus.textContent = 'Vídeo descargado (disponible offline)';
+        dom.cacheStatus.classList.add('cached');
+        stopDownloadPolling();
+      } else if (data.status === 'downloading') {
+        dom.cacheStatus.textContent = `Descargando... ${data.progress}%`;
+      } else {
+        dom.cacheStatus.textContent = '';
+        dom.cacheStatus.classList.remove('active');
+        stopDownloadPolling();
       }
-    });
-  });
+    } catch {
+      // Sin conexión, dejar de pedir
+      stopDownloadPolling();
+    }
+  }, 1500);
 }
 
-function onPlayerStateChange(event) {
-  const code = event.data;
+function stopDownloadPolling() {
+  if (downloadPollInterval) {
+    clearInterval(downloadPollInterval);
+    downloadPollInterval = null;
+  }
+}
 
-  if (code === YT.PlayerState.PLAYING) {
-    setStatus('Reproduciendo', 'success');
-    startSilentAudio(); // Mantener sesión de audio iOS
+// ═══════════════════════════════════════════════════════
+// REPRODUCTOR DE VÍDEO
+// ═══════════════════════════════════════════════════════
+
+function setupVideoEvents() {
+  const v = dom.video;
+
+  v.addEventListener('play', () => {
+    state.isPlaying = true;
+    updatePlayBtn();
+    startSilentAudio();
     startPositionSaving();
     updateMediaSessionState('playing');
     dom.timerSection.classList.add('active');
-  } else if (code === YT.PlayerState.PAUSED) {
+  });
+
+  v.addEventListener('pause', () => {
+    state.isPlaying = false;
+    updatePlayBtn();
     savePosition();
     updateMediaSessionState('paused');
-  } else if (code === YT.PlayerState.ENDED) {
-    savePosition(true); // marcar como terminado
+  });
+
+  v.addEventListener('timeupdate', () => {
+    if (!state.isSeeking) updateProgress();
+  });
+
+  v.addEventListener('loadedmetadata', () => {
+    if (v.duration && isFinite(v.duration)) {
+      dom.timeDur.textContent = formatTime(v.duration);
+      dom.progress.max = v.duration;
+    }
+  });
+
+  v.addEventListener('durationchange', () => {
+    if (v.duration && isFinite(v.duration)) {
+      dom.timeDur.textContent = formatTime(v.duration);
+      dom.progress.max = v.duration;
+    }
+  });
+
+  v.addEventListener('ended', () => {
+    state.isPlaying = false;
+    updatePlayBtn();
+    clearSavedPosition(state.videoId);
     stopPositionSaving();
-    updateMediaSessionState('paused');
     playNextFromHistory();
-  } else if (code === YT.PlayerState.BUFFERING) {
-    setStatus('Cargando...', '');
+  });
+
+  v.addEventListener('error', async () => {
+    if (!state.hasRetried && state.videoId) {
+      state.hasRetried = true;
+      setStatus('Reintentando...', '');
+      try {
+        await fetch(`/api/info/${state.videoId}?refresh=1`);
+        v.src = `/api/stream/${state.videoId}?t=${Date.now()}`;
+        await v.play();
+        return;
+      } catch {}
+    }
+    setStatus('Error de reproducción', 'error');
+    setButtonLoading(false);
+  });
+
+  v.addEventListener('waiting', () => setStatus('Cargando...'));
+  v.addEventListener('playing', () => {
+    if (state.info) setStatus(state.info.title, 'success');
+  });
+}
+
+function updatePlayBtn() {
+  dom.ctrlPlay.textContent = state.isPlaying ? '⏸' : '▶';
+}
+
+function updateProgress() {
+  const v = dom.video;
+  if (!v || !v.duration || !isFinite(v.duration)) return;
+  dom.progress.value = v.currentTime;
+  dom.timeCur.textContent = formatTime(v.currentTime);
+  const pct = (v.currentTime / v.duration) * 100;
+  dom.progress.style.setProperty('--fill', `${pct}%`);
+}
+
+function togglePlayPause() {
+  const v = dom.video;
+  if (!v || !v.src) return;
+  if (state.isPlaying) {
+    v.pause();
+  } else {
+    startSilentAudio();
+    v.play().catch(() => {});
   }
+}
+
+function seekRelative(delta) {
+  const v = dom.video;
+  if (!v || !v.duration) return;
+  v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + delta));
 }
 
 // ═══════════════════════════════════════════════════════
@@ -246,40 +278,76 @@ function onPlayerStateChange(event) {
 
 async function playVideo(videoId, startTime) {
   setButtonLoading(true);
-  setStatus('Cargando reproductor...');
+  setStatus('Obteniendo vídeo...');
   state.videoId = videoId;
-  dom.resumeBanner.classList.remove('active');
+  state.hasRetried = false;
+  dom.resume.classList.remove('active');
+  dom.cacheStatus.classList.remove('active', 'cached');
 
-  // Si no se especificó tiempo, comprobar si hay posición guardada
+  // Comprobar posición guardada
   const saved = getSavedPosition(videoId);
   if (startTime === undefined && saved && saved.time > 5) {
-    // Mostrar banner de reanudación
     showResumeBanner(videoId, saved.time);
     setButtonLoading(false);
     return;
   }
 
-  dom.playerSection.classList.add('active');
-
-  // Iniciar audio silencioso en contexto de gesto de usuario
   startSilentAudio();
 
   try {
-    await loadYouTubeAPI();
-    const player = await createPlayer(videoId, startTime || 0);
+    const res = await fetch(`/api/info/${videoId}`);
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error(e.error || `Error ${res.status}`);
+    }
+    const info = await res.json();
+    state.info = info;
 
-    const videoData = player.getVideoData();
-    const title = videoData.title || 'Vídeo de YouTube';
-    const author = videoData.author || '';
+    // Mostrar player
+    dom.player.classList.add('active');
+    dom.title.textContent = info.title;
+    dom.author.textContent = info.author;
+    dom.timeDur.textContent = formatTime(info.duration);
+    dom.progress.max = info.duration || 100;
+    dom.progress.value = startTime || 0;
+    dom.timeCur.textContent = formatTime(startTime || 0);
+    dom.progress.style.setProperty('--fill', '0%');
 
-    setStatus(title, 'success');
-    addToHistory(videoId, title, author);
-    setButtonLoading(false);
+    // Cargar vídeo
+    const v = dom.video;
+    v.src = `/api/stream/${videoId}`;
+    v.poster = info.thumb;
+
+    if (startTime && startTime > 0) {
+      await new Promise(r => {
+        const handler = () => { v.currentTime = startTime; r(); };
+        if (v.readyState >= 1) handler();
+        else v.addEventListener('loadedmetadata', handler, { once: true });
+        setTimeout(r, 8000);
+      });
+    }
+
+    await v.play();
+
+    setupMediaSession(info);
+    addToHistory(videoId, info.title, info.author);
+    setStatus(info.title, 'success');
+
+    // Si el servidor indica que ya está cacheado
+    if (info.cached) {
+      dom.cacheStatus.textContent = 'Vídeo descargado (disponible offline)';
+      dom.cacheStatus.classList.add('active', 'cached');
+    } else {
+      // Pedir descarga y seguir progreso
+      fetch(`/api/download/${videoId}`).catch(() => {});
+      startDownloadPolling(videoId);
+    }
   } catch (err) {
     console.error('Error:', err);
-    setStatus('Error al cargar el vídeo', 'error');
-    setButtonLoading(false);
+    setStatus(err.message || 'Error al cargar', 'error');
   }
+
+  setButtonLoading(false);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -287,15 +355,13 @@ async function playVideo(videoId, startTime) {
 // ═══════════════════════════════════════════════════════
 
 function savePosition(ended) {
-  if (!state.player || !state.playerReady || !state.videoId) return;
+  const v = dom.video;
+  if (!v || !state.videoId) return;
   try {
-    const time = ended ? 0 : state.player.getCurrentTime();
-    const duration = state.player.getDuration();
-    if (!duration) return;
-
-    // No guardar si está al principio o al final
+    const time = ended ? 0 : v.currentTime;
+    const duration = v.duration;
+    if (!duration || !isFinite(duration)) return;
     if (!ended && (time < 5 || time > duration - 5)) return;
-
     localStorage.setItem(`yt-pos-${state.videoId}`, JSON.stringify({
       time: Math.floor(time),
       duration: Math.floor(duration),
@@ -309,8 +375,7 @@ function getSavedPosition(videoId) {
     const raw = localStorage.getItem(`yt-pos-${videoId}`);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    // Ignorar posiciones de hace más de 30 días
-    if (Date.now() - data.date > 30 * 24 * 60 * 60 * 1000) return null;
+    if (Date.now() - data.date > 30 * 24 * 3600000) return null;
     return data;
   } catch { return null; }
 }
@@ -333,135 +398,93 @@ function stopPositionSaving() {
 
 function showResumeBanner(videoId, time) {
   dom.resumeText.textContent = `Continuar desde ${formatTime(time)}`;
-  dom.resumeBanner.classList.add('active');
-
+  dom.resume.classList.add('active');
   dom.btnResume.onclick = () => {
-    dom.resumeBanner.classList.remove('active');
+    dom.resume.classList.remove('active');
     playVideo(videoId, time);
   };
   dom.btnRestart.onclick = () => {
-    dom.resumeBanner.classList.remove('active');
+    dom.resume.classList.remove('active');
     clearSavedPosition(videoId);
     playVideo(videoId, 0);
   };
 }
 
 // ═══════════════════════════════════════════════════════
-// TEMPORIZADOR (SLEEP TIMER)
+// TEMPORIZADOR
 // ═══════════════════════════════════════════════════════
 
 function startTimer(minutes) {
   clearTimer();
-
   if (minutes <= 0) return;
 
-  state.timerMinutes = minutes;
-  state.timerEnd = Date.now() + minutes * 60 * 1000;
-
-  // Marcar botón activo
-  dom.timerButtons.querySelectorAll('.timer-btn').forEach(btn => {
+  state.timerEnd = Date.now() + minutes * 60000;
+  dom.timerBtns.querySelectorAll('.timer-btn').forEach(btn => {
     btn.classList.toggle('active', parseInt(btn.dataset.timer) === minutes);
   });
   dom.timerOff.classList.remove('active');
-
-  // Mostrar countdown
   dom.timerCountdown.classList.add('active');
   updateTimerDisplay();
 
   state.timerInterval = setInterval(() => {
     const remaining = state.timerEnd - Date.now();
-
-    if (remaining <= 0) {
-      // Tiempo agotado: pausar y guardar posición
-      timerExpired();
-      return;
-    }
-
-    // Fade out en los últimos 30 segundos
-    if (remaining <= 30000 && state.silentAudio) {
-      state.silentAudio.volume = Math.max(0.001, (remaining / 30000) * 0.01);
-    }
-
+    if (remaining <= 0) { timerExpired(); return; }
     updateTimerDisplay();
   }, 1000);
 }
 
 function updateTimerDisplay() {
   if (!state.timerEnd) return;
-  const remaining = Math.max(0, state.timerEnd - Date.now());
-  const mins = Math.floor(remaining / 60000);
-  const secs = Math.floor((remaining % 60000) / 1000);
-  dom.timerCountdownTime.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+  const rem = Math.max(0, state.timerEnd - Date.now());
+  const m = Math.floor(rem / 60000);
+  const s = Math.floor((rem % 60000) / 1000);
+  dom.timerTime.textContent = `${m}:${String(s).padStart(2, '0')}`;
 }
 
 function timerExpired() {
   savePosition();
-
-  if (state.player && state.playerReady) {
-    state.player.pauseVideo();
-  }
-
+  dom.video.pause();
   clearTimer();
   setStatus('Temporizador: reproducción pausada', 'success');
 }
 
 function clearTimer() {
-  if (state.timerInterval) {
-    clearInterval(state.timerInterval);
-    state.timerInterval = null;
-  }
+  if (state.timerInterval) { clearInterval(state.timerInterval); state.timerInterval = null; }
   state.timerEnd = null;
-  state.timerMinutes = 0;
   dom.timerCountdown.classList.remove('active');
-  dom.timerButtons.querySelectorAll('.timer-btn').forEach(btn => btn.classList.remove('active'));
+  dom.timerBtns.querySelectorAll('.timer-btn').forEach(btn => btn.classList.remove('active'));
   dom.timerOff.classList.add('active');
-
-  // Restaurar volumen del audio silencioso
-  if (state.silentAudio) state.silentAudio.volume = 0.01;
 }
 
 // ═══════════════════════════════════════════════════════
-// MEDIA SESSION (controles en pantalla de bloqueo)
+// MEDIA SESSION
 // ═══════════════════════════════════════════════════════
 
-function setupMediaSession(player) {
+function setupMediaSession(info) {
   if (!('mediaSession' in navigator)) return;
 
-  const videoData = player.getVideoData();
-
   navigator.mediaSession.metadata = new MediaMetadata({
-    title: videoData.title || 'YouTube',
-    artist: videoData.author || '',
+    title: info.title,
+    artist: info.author,
     artwork: [
-      { src: `https://i.ytimg.com/vi/${state.videoId}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' },
+      { src: info.thumb, sizes: '480x360', type: 'image/jpeg' },
       { src: `https://i.ytimg.com/vi/${state.videoId}/maxresdefault.jpg`, sizes: '1280x720', type: 'image/jpeg' }
     ]
   });
 
   navigator.mediaSession.setActionHandler('play', () => {
-    if (state.playerReady) state.player.playVideo();
+    startSilentAudio();
+    dom.video.play().catch(() => {});
   });
-  navigator.mediaSession.setActionHandler('pause', () => {
-    if (state.playerReady) state.player.pauseVideo();
-  });
-  navigator.mediaSession.setActionHandler('seekbackward', () => {
-    if (state.playerReady) {
-      state.player.seekTo(Math.max(0, state.player.getCurrentTime() - 15), true);
-    }
-  });
-  navigator.mediaSession.setActionHandler('seekforward', () => {
-    if (state.playerReady) {
-      state.player.seekTo(state.player.getCurrentTime() + 15, true);
-    }
-  });
+  navigator.mediaSession.setActionHandler('pause', () => dom.video.pause());
+  navigator.mediaSession.setActionHandler('seekbackward', () => seekRelative(-15));
+  navigator.mediaSession.setActionHandler('seekforward', () => seekRelative(15));
   navigator.mediaSession.setActionHandler('previoustrack', () => playPrevFromHistory());
   navigator.mediaSession.setActionHandler('nexttrack', () => playNextFromHistory());
 }
 
-function updateMediaSessionState(playbackState) {
-  if ('mediaSession' in navigator) {
-    navigator.mediaSession.playbackState = playbackState;
-  }
+function updateMediaSessionState(s) {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = s;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -470,12 +493,8 @@ function updateMediaSessionState(playbackState) {
 
 function addToHistory(videoId, title, author) {
   state.history = state.history.filter(h => h.id !== videoId);
-  state.history.unshift({
-    id: videoId,
-    title,
-    author,
-    thumb: `https://i.ytimg.com/vi/${videoId}/default.jpg`
-  });
+  state.history.unshift({ id: videoId, title, author,
+    thumb: `https://i.ytimg.com/vi/${videoId}/default.jpg` });
   if (state.history.length > 30) state.history.pop();
   localStorage.setItem('yt-history', JSON.stringify(state.history));
   renderHistory();
@@ -501,8 +520,7 @@ function renderHistory() {
   dom.historyList.innerHTML = state.history.map(h => {
     const saved = getSavedPosition(h.id);
     const badge = saved && saved.time > 5
-      ? `<span class="history-badge">${formatTime(saved.time)}</span>`
-      : '';
+      ? `<span class="history-badge">${formatTime(saved.time)}</span>` : '';
     return `
       <div class="history-item" data-id="${h.id}">
         <img class="history-thumb" src="${h.thumb}" alt="" loading="lazy">
@@ -518,15 +536,13 @@ function renderHistory() {
 function playNextFromHistory() {
   if (state.history.length < 2) return;
   const idx = state.history.findIndex(h => h.id === state.videoId);
-  const next = (idx + 1) % state.history.length;
-  playVideo(state.history[next].id);
+  playVideo(state.history[(idx + 1) % state.history.length].id);
 }
 
 function playPrevFromHistory() {
   if (state.history.length < 2) return;
   const idx = state.history.findIndex(h => h.id === state.videoId);
-  const prev = (idx - 1 + state.history.length) % state.history.length;
-  playVideo(state.history[prev].id);
+  playVideo(state.history[(idx - 1 + state.history.length) % state.history.length].id);
 }
 
 // ─── Clipboard ───
@@ -549,27 +565,16 @@ function handlePlayRequest() {
   playVideo(videoId);
 }
 
-// ─── Banner de instalación ───
 function checkInstallBanner() {
   const isStandalone = window.matchMedia('(display-mode: standalone)').matches
     || window.navigator.standalone === true;
   const dismissed = localStorage.getItem('install-dismissed');
-  if (!isStandalone && !dismissed) {
-    dom.installBanner.style.display = 'block';
-  }
+  if (!isStandalone && !dismissed) dom.installBanner.style.display = 'block';
 }
 
-// ─── Guardar posición al cerrar/bloquear ───
 function setupVisibilityHandler() {
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      savePosition();
-    }
-  });
-
-  window.addEventListener('beforeunload', () => {
-    savePosition();
-  });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) savePosition(); });
+  window.addEventListener('beforeunload', () => savePosition());
 }
 
 // ═══════════════════════════════════════════════════════
@@ -578,15 +583,12 @@ function setupVisibilityHandler() {
 
 function init() {
   initDOM();
+  setupVideoEvents();
 
-  // Input
   dom.btnPaste.addEventListener('click', pasteFromClipboard);
   dom.btnPlay.addEventListener('click', handlePlayRequest);
-  dom.urlInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') handlePlayRequest();
-  });
+  dom.urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') handlePlayRequest(); });
 
-  // Auto-pegar al focus
   dom.urlInput.addEventListener('focus', async () => {
     if (dom.urlInput.value === '') {
       try {
@@ -596,20 +598,35 @@ function init() {
     }
   });
 
+  // Controles
+  dom.ctrlPlay.addEventListener('click', togglePlayPause);
+  dom.ctrlBack.addEventListener('click', () => seekRelative(-15));
+  dom.ctrlFwd.addEventListener('click', () => seekRelative(15));
+  dom.ctrlPrev.addEventListener('click', () => playPrevFromHistory());
+  dom.ctrlNext.addEventListener('click', () => playNextFromHistory());
+
+  // Progress bar
+  dom.progress.addEventListener('input', () => {
+    state.isSeeking = true;
+    dom.timeCur.textContent = formatTime(dom.progress.value);
+    const pct = (dom.progress.value / dom.progress.max) * 100;
+    dom.progress.style.setProperty('--fill', `${pct}%`);
+  });
+  dom.progress.addEventListener('change', () => {
+    dom.video.currentTime = parseFloat(dom.progress.value);
+    state.isSeeking = false;
+  });
+
   // Timer
-  dom.timerButtons.addEventListener('click', (e) => {
+  dom.timerBtns.addEventListener('click', e => {
     const btn = e.target.closest('[data-timer]');
     if (!btn) return;
     const mins = parseInt(btn.dataset.timer);
-    if (mins === 0) {
-      clearTimer();
-    } else {
-      startTimer(mins);
-    }
+    if (mins === 0) clearTimer(); else startTimer(mins);
   });
 
   // Historial
-  dom.historyList.addEventListener('click', (e) => {
+  dom.historyList.addEventListener('click', e => {
     const del = e.target.closest('[data-delete]');
     if (del) { e.stopPropagation(); removeFromHistory(del.dataset.delete); return; }
     const item = e.target.closest('.history-item');
@@ -630,7 +647,6 @@ function init() {
   renderHistory();
   checkInstallBanner();
   setupVisibilityHandler();
-  loadYouTubeAPI(); // pre-cargar
 }
 
 document.addEventListener('DOMContentLoaded', init);
