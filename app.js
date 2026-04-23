@@ -166,38 +166,129 @@ function stopDownloadPolling() {
   }
 }
 
-function startDeviceCache(videoId) {
-  if (!navigator.serviceWorker || !navigator.serviceWorker.controller) {
-    dom.cacheStatus.textContent = 'Listo (sin cache offline)';
+async function startDeviceCache(videoId) {
+  // Si ya hay una descarga en curso para otro vídeo, no la paramos
+  // (se guarda su estado parcial automáticamente si sale)
+  if (activeDownload && activeDownload.videoId !== videoId) {
+    // El cambio de vídeo interrumpe la descarga anterior, pero el estado
+    // parcial queda guardado en IndexedDB para reanudar después
+    activeDownload.abortController.abort();
+  }
+  if (activeDownload && activeDownload.videoId === videoId) {
+    return; // ya está descargando este
+  }
+
+  // Si ya está completo
+  if (await isVideoCachedOnDevice(videoId)) {
+    dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
+    dom.cacheStatus.classList.add('active', 'cached');
     return;
   }
-  dom.cacheStatus.textContent = 'Guardando en móvil...';
-  navigator.serviceWorker.controller.postMessage({
-    type: 'CACHE_VIDEO',
-    videoId: videoId,
-    url: `/api/stream/${videoId}`
-  });
-}
 
-function setupSwMessages() {
-  if (!navigator.serviceWorker) return;
-  navigator.serviceWorker.addEventListener('message', (event) => {
-    const msg = event.data;
-    if (msg.type === 'DEVICE_CACHE_PROGRESS') {
-      if (msg.percent >= 100) {
-        dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
-        dom.cacheStatus.classList.add('cached');
-        renderHistory(); // actualizar badge offline en historial
-      } else {
-        dom.cacheStatus.textContent = `Guardando en móvil... ${msg.percent}%`;
+  // ¿Hay una descarga parcial anterior?
+  const partial = await getPartialDownload(videoId);
+  const existingChunks = partial ? partial.chunks : [];
+  let received = partial ? partial.receivedBytes : 0;
+  let totalSize = partial ? partial.totalSize : 0;
+  let contentType = partial ? partial.contentType : 'video/mp4';
+
+  const abortController = new AbortController();
+  activeDownload = { videoId, abortController };
+
+  dom.cacheStatus.textContent = received > 0
+    ? `Reanudando descarga... ${totalSize ? Math.floor((received/totalSize)*100) : 0}%`
+    : 'Guardando en móvil...';
+  dom.cacheStatus.classList.add('active');
+  dom.cacheStatus.classList.remove('cached');
+
+  // Guardado periódico del estado parcial (cada 3s)
+  let lastSave = Date.now();
+  const SAVE_INTERVAL = 3000;
+
+  try {
+    const headers = {};
+    if (received > 0) headers['Range'] = `bytes=${received}-`;
+
+    const response = await fetch(`/api/stream/${videoId}`, {
+      signal: abortController.signal,
+      headers
+    });
+
+    if (!response.ok && response.status !== 206) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    // Leer tamaño total desde Content-Range o Content-Length
+    const contentRange = response.headers.get('Content-Range');
+    if (contentRange) {
+      const m = contentRange.match(/\/(\d+)/);
+      if (m) totalSize = parseInt(m[1], 10);
+    } else {
+      const len = parseInt(response.headers.get('Content-Length') || '0', 10);
+      if (len > 0) totalSize = received + len;
+    }
+    contentType = response.headers.get('Content-Type') || contentType;
+
+    if (!response.body) {
+      const buffer = await response.arrayBuffer();
+      existingChunks.push(buffer);
+      await completeDownload(videoId, existingChunks, contentType);
+      dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
+      dom.cacheStatus.classList.add('cached');
+      renderHistory();
+      if (activeDownload && activeDownload.videoId === videoId) activeDownload = null;
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [...existingChunks];
+    let lastPct = -1;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // Copiar a ArrayBuffer (IndexedDB no acepta Uint8Array con buffer compartido)
+      const buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      chunks.push(buf);
+      received += value.byteLength;
+
+      if (totalSize > 0) {
+        const pct = Math.floor((received / totalSize) * 100);
+        if (pct !== lastPct) {
+          lastPct = pct;
+          dom.cacheStatus.textContent = `Guardando en móvil... ${pct}%`;
+        }
       }
-    } else if (msg.type === 'DEVICE_CACHE_EVICTED') {
-      renderHistory(); // actualizar badges
-    } else if (msg.type === 'DEVICE_CACHE_ERROR') {
-      dom.cacheStatus.textContent = 'Error al guardar en móvil';
+
+      // Guardado periódico del progreso
+      if (Date.now() - lastSave > SAVE_INTERVAL) {
+        lastSave = Date.now();
+        await savePartialDownload(videoId, chunks, received, totalSize, contentType);
+      }
+    }
+
+    // Completado
+    await completeDownload(videoId, chunks, contentType);
+    dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
+    dom.cacheStatus.classList.add('cached');
+    renderHistory();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      // Descarga cancelada (usuario cambió de vídeo o cerró)
+      // El estado parcial ya está guardado
+      console.log('Descarga cancelada para', videoId);
+    } else {
+      console.error('Error cacheando en dispositivo:', e);
+      // Guardar lo que tengamos antes de fallar
+      // (ya se ha ido guardando cada 3s)
+      dom.cacheStatus.textContent = 'Descarga interrumpida (reanudable)';
       setTimeout(() => dom.cacheStatus.classList.remove('active'), 3000);
     }
-  });
+  } finally {
+    if (activeDownload && activeDownload.videoId === videoId) {
+      activeDownload = null;
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -320,24 +411,175 @@ function toggleFullscreen() {
 }
 
 // ═══════════════════════════════════════════════════════
-// GESTIÓN DE CACHE (consultar/borrar vídeos individuales)
+// INDEXEDDB VIDEO CACHE (con descargas reanudables)
 // ═══════════════════════════════════════════════════════
+// Dos object stores:
+//   - videos: { id, data (ArrayBuffer), date, contentType } - vídeos completos
+//   - downloads: { id, chunks (Array<ArrayBuffer>), receivedBytes,
+//                  totalSize, contentType, date } - descargas en progreso
+
+const DB_NAME = 'yt-video-cache';
+const DB_VERSION = 2;
+const VIDEOS_STORE = 'videos';
+const DOWNLOADS_STORE = 'downloads';
+
+// Controlador de descarga actual (para poder cancelar)
+let activeDownload = null; // { videoId, abortController }
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (event) => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(VIDEOS_STORE)) {
+        db.createObjectStore(VIDEOS_STORE, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(DOWNLOADS_STORE)) {
+        db.createObjectStore(DOWNLOADS_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGet(storeName, key) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => resolve(null);
+  })).catch(() => null);
+}
+
+function idbPut(storeName, value) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
+
+function idbDelete(storeName, key) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+  })).catch(() => {});
+}
+
+function idbCount(storeName, key) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).count(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(0);
+  })).catch(() => 0);
+}
+
+function idbGetAll(storeName) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => resolve([]);
+  })).catch(() => []);
+}
 
 async function isVideoCachedOnDevice(videoId) {
-  if (!('caches' in window)) return false;
+  const count = await idbCount(VIDEOS_STORE, videoId);
+  return count > 0;
+}
+
+async function getCachedBlobUrl(videoId) {
+  const record = await idbGet(VIDEOS_STORE, videoId);
+  if (!record || !record.data) return null;
+  const blob = new Blob([record.data], { type: record.contentType || 'video/mp4' });
+  return URL.createObjectURL(blob);
+}
+
+async function getPartialDownload(videoId) {
+  return idbGet(DOWNLOADS_STORE, videoId);
+}
+
+async function savePartialDownload(videoId, chunks, receivedBytes, totalSize, contentType) {
   try {
-    const cache = await caches.open('yt-video-v1');
-    const match = await cache.match(`/api/stream/${videoId}`);
-    return !!match;
-  } catch { return false; }
+    await idbPut(DOWNLOADS_STORE, {
+      id: videoId,
+      chunks,
+      receivedBytes,
+      totalSize,
+      contentType: contentType || 'video/mp4',
+      date: Date.now()
+    });
+  } catch (e) {
+    // Sin espacio — intentar desalojar el más viejo y reintentar
+    await evictOldest(videoId);
+    try { await idbPut(DOWNLOADS_STORE, {
+      id: videoId, chunks, receivedBytes, totalSize,
+      contentType: contentType || 'video/mp4', date: Date.now()
+    }); } catch {}
+  }
+}
+
+async function completeDownload(videoId, chunks, contentType) {
+  // Juntar todos los chunks en un solo ArrayBuffer
+  const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+
+  const save = () => idbPut(VIDEOS_STORE, {
+    id: videoId,
+    data: buffer.buffer,
+    contentType: contentType || 'video/mp4',
+    date: Date.now()
+  });
+
+  try {
+    await save();
+  } catch {
+    await evictOldest(videoId);
+    await save();
+  }
+
+  // Borrar el parcial
+  await idbDelete(DOWNLOADS_STORE, videoId);
+}
+
+async function evictOldest(excludeId) {
+  // Prioridad: borrar antes parciales abandonados que vídeos completos
+  const partials = await idbGetAll(DOWNLOADS_STORE);
+  const old = partials
+    .filter(p => p.id !== excludeId && Date.now() - (p.date || 0) > 24 * 3600000);
+  for (const p of old) {
+    await idbDelete(DOWNLOADS_STORE, p.id);
+    return;
+  }
+
+  const videos = await idbGetAll(VIDEOS_STORE);
+  videos.sort((a, b) => (a.date || 0) - (b.date || 0));
+  for (const v of videos) {
+    if (v.id === excludeId) continue;
+    await idbDelete(VIDEOS_STORE, v.id);
+    return;
+  }
 }
 
 async function deleteCachedVideo(videoId) {
-  if (!('caches' in window)) return;
-  try {
-    const cache = await caches.open('yt-video-v1');
-    await cache.delete(`/api/stream/${videoId}`);
-  } catch {}
+  await idbDelete(VIDEOS_STORE, videoId);
+  await idbDelete(DOWNLOADS_STORE, videoId);
+  renderHistory();
+}
+
+async function deleteCachedVideo(videoId) {
+  await deleteCachedVideoFromDB(videoId);
   renderHistory();
 }
 
@@ -364,19 +606,39 @@ async function playVideo(videoId, startTime) {
   startSilentAudio();
 
   try {
-    const res = await fetch(`/api/info/${videoId}`);
-    if (!res.ok) {
-      const e = await res.json().catch(() => ({}));
-      throw new Error(e.error || `Error ${res.status}`);
+    // Intentar obtener info del servidor, pero si estamos offline
+    // usar los datos del historial local
+    let info = null;
+    const cachedOnDevice = await isVideoCachedOnDevice(videoId);
+
+    try {
+      const res = await fetch(`/api/info/${videoId}`);
+      if (res.ok) info = await res.json();
+    } catch {}
+
+    if (!info) {
+      // Offline — buscar en historial local
+      const histEntry = state.history.find(h => h.id === videoId);
+      if (histEntry && cachedOnDevice) {
+        info = {
+          title: histEntry.title,
+          author: histEntry.author,
+          duration: 0,
+          thumb: histEntry.thumb,
+          cached: true
+        };
+      } else {
+        throw new Error('Sin conexión y vídeo no disponible');
+      }
     }
-    const info = await res.json();
+
     state.info = info;
 
     // Mostrar player
     dom.player.classList.add('active');
     dom.title.textContent = info.title;
     dom.author.textContent = info.author;
-    dom.timeDur.textContent = formatTime(info.duration);
+    if (info.duration) dom.timeDur.textContent = formatTime(info.duration);
     dom.progress.max = info.duration || 100;
     dom.progress.value = startTime || 0;
     dom.timeCur.textContent = formatTime(startTime || 0);
@@ -385,14 +647,23 @@ async function playVideo(videoId, startTime) {
     const v = dom.video;
     v.poster = info.thumb;
 
-    if (!info.cached) {
+    if (!info.cached && !cachedOnDevice) {
       // Pedir descarga al servidor en background
       fetch(`/api/download/${videoId}`).catch(() => {});
     }
 
-    // Poner src inmediatamente (el servidor espera si aún está descargando)
-    // Esto mantiene la cadena de gesto de usuario para que iOS permita play()
-    v.src = `/api/stream/${videoId}`;
+    // Si está cacheado en el dispositivo, usar blob URL directamente
+    // (iOS Safari no soporta Range requests desde Service Worker)
+    if (cachedOnDevice) {
+      const blobUrl = await getCachedBlobUrl(videoId);
+      if (blobUrl) {
+        v.src = blobUrl;
+      } else {
+        v.src = `/api/stream/${videoId}`;
+      }
+    } else {
+      v.src = `/api/stream/${videoId}`;
+    }
     setStatus('Cargando vídeo...');
 
     if (startTime && startTime > 0) {
@@ -407,13 +678,15 @@ async function playVideo(videoId, startTime) {
     // play() en contexto de gesto — iOS lo permite
     v.play().catch(() => {});
 
-    // Mostrar progreso del servidor si aún está descargando
-    if (!info.cached) {
+    if (cachedOnDevice) {
+      dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
+      dom.cacheStatus.classList.add('active', 'cached');
+    } else if (!info.cached) {
       dom.cacheStatus.textContent = 'Servidor descargando...';
       dom.cacheStatus.classList.add('active');
       waitForServerThenCacheOnDevice(videoId);
     } else {
-      // Ya en servidor, cachear en móvil directamente
+      // En servidor pero no en móvil, cachear
       dom.cacheStatus.classList.add('active');
       startDeviceCache(videoId);
     }
@@ -578,10 +851,21 @@ function addToHistory(videoId, title, author) {
   renderHistory();
 }
 
-function removeFromHistory(videoId) {
+async function removeFromHistory(videoId) {
+  // Si hay una descarga activa para este vídeo, abortarla
+  if (activeDownload && activeDownload.videoId === videoId) {
+    activeDownload.abortController.abort();
+    activeDownload = null;
+  }
+
   state.history = state.history.filter(h => h.id !== videoId);
   clearSavedPosition(videoId);
   localStorage.setItem('yt-history', JSON.stringify(state.history));
+
+  // Borrar también del cache (completo y parcial) para no dejar rémoras
+  await idbDelete(VIDEOS_STORE, videoId);
+  await idbDelete(DOWNLOADS_STORE, videoId);
+
   renderHistory();
 }
 
@@ -595,18 +879,31 @@ async function renderHistory() {
     return;
   }
 
-  // Comprobar qué vídeos están cacheados en el dispositivo
-  const cacheChecks = await Promise.all(
-    state.history.map(h => isVideoCachedOnDevice(h.id))
-  );
+  // Comprobar estado de cache (completo / parcial) de cada vídeo
+  const cacheChecks = await Promise.all(state.history.map(async h => {
+    const cached = await isVideoCachedOnDevice(h.id);
+    if (cached) return { complete: true };
+    const partial = await getPartialDownload(h.id);
+    if (partial && partial.totalSize > 0) {
+      return {
+        partial: true,
+        pct: Math.floor((partial.receivedBytes / partial.totalSize) * 100)
+      };
+    }
+    return {};
+  }));
 
   dom.historyList.innerHTML = state.history.map((h, i) => {
     const saved = getSavedPosition(h.id);
     const posBadge = saved && saved.time > 5
       ? `<span class="history-badge">${formatTime(saved.time)}</span>` : '';
-    const cached = cacheChecks[i];
-    const cacheBadge = cached
-      ? `<span class="cache-badge" data-uncache="${h.id}">offline ✕</span>` : '';
+    const state = cacheChecks[i];
+    let cacheBadge = '';
+    if (state.complete) {
+      cacheBadge = `<span class="cache-badge" data-uncache="${h.id}">offline ✕</span>`;
+    } else if (state.partial) {
+      cacheBadge = `<span class="cache-badge partial" data-uncache="${h.id}">${state.pct}% ✕</span>`;
+    }
     return `
       <div class="history-item" data-id="${h.id}">
         <img class="history-thumb" src="${h.thumb}" alt="" loading="lazy">
@@ -670,7 +967,6 @@ function setupVisibilityHandler() {
 function init() {
   initDOM();
   setupVideoEvents();
-  setupSwMessages();
 
   dom.btnPaste.addEventListener('click', pasteFromClipboard);
   dom.btnPlay.addEventListener('click', handlePlayRequest);

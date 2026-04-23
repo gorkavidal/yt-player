@@ -509,6 +509,11 @@ body {
   cursor: pointer;
 }
 
+.cache-badge.partial {
+  background: #ffa94d;
+  color: #000;
+}
+
 .cache-badge:active {
   opacity: 0.6;
 }

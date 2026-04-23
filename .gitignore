@@ -1,3 +1,4 @@
 node_modules/
 .yt-flow.*
+.yt-cache-flow.*
 package-lock.json
