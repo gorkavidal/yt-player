@@ -5,10 +5,12 @@ APP_NAME="YT Cache"
 PORT="${PORT:-4176}"
 TS_HTTPS_PORT="${TS_HTTPS_PORT:-4448}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="${SCRIPT_DIR}/.yt-cache-flow.pid"
-LOG_FILE="${SCRIPT_DIR}/.yt-cache-flow.log"
-PORT_FILE="${SCRIPT_DIR}/.yt-cache-flow.port"
-TS_PORT_FILE="${SCRIPT_DIR}/.yt-cache-flow.ts-port"
+STATE_DIR="${HOME}/Library/Application Support/bunker-apps/yt-cache-flow"
+mkdir -p "${STATE_DIR}"
+PID_FILE="${STATE_DIR}/pid"
+LOG_FILE="${STATE_DIR}/log"
+PORT_FILE="${STATE_DIR}/port"
+TS_PORT_FILE="${STATE_DIR}/ts-port"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 get_pid() { [[ -f "${PID_FILE}" ]] && cat "${PID_FILE}"; }
