@@ -59,13 +59,32 @@ function downloadVideo(videoId) {
   // Ya descargando
   if (downloads.has(videoId)) return downloads.get(videoId).promise;
 
+  // Registrar el slot inmediatamente (sin await) para evitar race conditions
+  const state = { progress: 0 };
+  const promise = _doDownload(videoId, state);
+  downloads.set(videoId, { promise, state });
+  return promise;
+}
+
+async function _doDownload(videoId, state) {
   const filePath = getVideoPath(videoId);
-  // Usar nombre sin extensión para -o, yt-dlp añade .mp4
   const tempBase = path.join(VIDEOS_DIR, `${videoId}.downloading`);
 
-  const state = { progress: 0 };
+  // Decidir resolución según duración: >1h baja a 480p para no reventar
+  // la cuota de IndexedDB en iOS (~1-2 GB) ni la memoria del navegador.
+  let maxHeight = 720;
+  try {
+    const info = await getInfo(videoId);
+    if (info.duration > 3600) maxHeight = 480;  // >1h
+    if (info.duration > 7200) maxHeight = 360;  // >2h
+  } catch {}
 
-  const promise = new Promise((resolve, reject) => {
+  const fmt =
+    `bestvideo[height<=${maxHeight}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/` +
+    `bestvideo[height<=${maxHeight}][vcodec^=avc1]+bestaudio/` +
+    `best[height<=${maxHeight}][vcodec^=avc1]`;
+
+  return new Promise((resolve, reject) => {
     // Limpiar vídeos anteriores del servidor (solo 1 en disco)
     try {
       const files = fs.readdirSync(VIDEOS_DIR);
@@ -77,13 +96,13 @@ function downloadVideo(videoId) {
     } catch {}
 
     const proc = spawn('yt-dlp', [
-      '-f', 'bestvideo[height<=720][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720][vcodec^=avc1]',
+      '-f', fmt,
       '--merge-output-format', 'mp4',
       '--no-playlist', '--no-warnings',
       '--newline',           // progreso línea a línea
       '-o', tempBase + '.%(ext)s',
       `https://www.youtube.com/watch?v=${videoId}`
-    ], { timeout: 300000 });
+    ], { timeout: 1800000 });  // 30 min (antes 5 min, insuficiente para vídeos largos)
 
     let stderr = '';
 
@@ -128,9 +147,6 @@ function downloadVideo(videoId) {
       reject(e);
     });
   });
-
-  downloads.set(videoId, { promise, state });
-  return promise;
 }
 
 const validId = id => /^[a-zA-Z0-9_-]{11}$/.test(id);

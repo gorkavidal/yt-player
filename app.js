@@ -496,8 +496,14 @@ async function isVideoCachedOnDevice(videoId) {
 
 async function getCachedBlobUrl(videoId) {
   const record = await idbGet(VIDEOS_STORE, videoId);
-  if (!record || !record.data) return null;
-  const blob = new Blob([record.data], { type: record.contentType || 'video/mp4' });
+  if (!record) return null;
+  // Nuevo formato: { chunks: [ArrayBuffer, ...] }
+  // Viejo formato (retrocompat): { data: ArrayBuffer }
+  const parts = record.chunks && record.chunks.length ? record.chunks
+               : record.data ? [record.data] : null;
+  if (!parts) return null;
+  // Blob constructor con array de ArrayBuffers NO copia, solo referencia
+  const blob = new Blob(parts, { type: record.contentType || 'video/mp4' });
   return URL.createObjectURL(blob);
 }
 
@@ -526,18 +532,12 @@ async function savePartialDownload(videoId, chunks, receivedBytes, totalSize, co
 }
 
 async function completeDownload(videoId, chunks, contentType) {
-  // Juntar todos los chunks en un solo ArrayBuffer
-  const total = chunks.reduce((s, c) => s + c.byteLength, 0);
-  const buffer = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    buffer.set(new Uint8Array(chunk), offset);
-    offset += chunk.byteLength;
-  }
-
+  // Guardamos los chunks como array en IndexedDB — sin concatenar en buffer
+  // contiguo. Un Uint8Array de 1 GB+ revienta por OOM en iOS Safari.
+  // El Blob constructor con array de ArrayBuffers no copia internamente.
   const save = () => idbPut(VIDEOS_STORE, {
     id: videoId,
-    data: buffer.buffer,
+    chunks: chunks,
     contentType: contentType || 'video/mp4',
     date: Date.now()
   });
