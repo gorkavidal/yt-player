@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="YT Player"
+PORT="${PORT:-4175}"
+TS_HTTPS_PORT="${TS_HTTPS_PORT:-4447}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="${SCRIPT_DIR}/.yt-flow.pid"
+LOG_FILE="${SCRIPT_DIR}/.yt-flow.log"
+PORT_FILE="${SCRIPT_DIR}/.yt-flow.port"
+TS_PORT_FILE="${SCRIPT_DIR}/.yt-flow.ts-port"
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+get_pid() { [[ -f "${PID_FILE}" ]] && cat "${PID_FILE}"; }
+get_saved_port() { [[ -f "${PORT_FILE}" ]] && cat "${PORT_FILE}" || echo "${PORT}"; }
+get_saved_ts_port() { [[ -f "${TS_PORT_FILE}" ]] && cat "${TS_PORT_FILE}" || echo "${TS_HTTPS_PORT}"; }
+
+listener_pid_by_port() { lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -n 1 || true; }
+pid_cwd() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1 || true; }
+
+is_our_server_pid() {
+  local pid="$1"
+  [[ -n "${pid}" ]] || return 1
+  local cmd cwd
+  cmd="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  cwd="$(pid_cwd "${pid}")"
+  [[ "${cmd}" == *"node server.js"* ]] && [[ "${cwd}" == "${SCRIPT_DIR}" ]]
+}
+
+find_free_port() {
+  local base="$1"
+  for candidate in $(seq "${base}" $((base + 20))); do
+    [[ -z "$(listener_pid_by_port "${candidate}")" ]] && echo "${candidate}" && return 0
+  done
+  return 1
+}
+
+serve_port_in_use() {
+  local port="$1"
+  tailscale serve status --json 2>/dev/null | node -e '
+    const fs=require("fs"),port=process.argv[1];let d={};
+    try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch{}
+    process.exit(Boolean(d.TCP&&d.TCP[port])?0:1);
+  ' "${port}"
+}
+
+serve_port_maps_to_target() {
+  local port="$1" target="$2"
+  tailscale serve status --json 2>/dev/null | node -e '
+    const fs=require("fs"),[port,target]=process.argv.slice(1);let d={};
+    try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch{}
+    let m=false;const w=d.Web||{};
+    for(const[h,c]of Object.entries(w)){if(!h.endsWith(":"+port))continue;
+    const hs=(c&&c.Handlers)||{};for(const v of Object.values(hs)){
+    if(v&&v.Proxy===target){m=true;break}}if(m)break}
+    process.exit(m?0:1);
+  ' "${port}" "${target}"
+}
+
+find_free_ts_port() {
+  local base="$1"
+  if [[ "${base}" == "443" ]]; then
+    for candidate in 4443 $(seq 4444 4480); do
+      serve_port_in_use "${candidate}" || { echo "${candidate}"; return 0; }
+    done
+  else
+    for candidate in $(seq "${base}" $((base + 40))); do
+      serve_port_in_use "${candidate}" || { echo "${candidate}"; return 0; }
+    done
+  fi
+  return 1
+}
+
+get_tailnet_dns_name() {
+  tailscale status --json 2>/dev/null | node -e '
+    const fs=require("fs");let d={};
+    try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch{}
+    let dns=(d.Self&&d.Self.DNSName)||"";
+    if(dns.endsWith("."))dns=dns.slice(0,-1);
+    process.stdout.write(dns);
+  '
+}
+
+build_tailnet_url() {
+  local https_port="$1" dns_name
+  dns_name="$(get_tailnet_dns_name)"
+  [[ -z "${dns_name}" ]] && echo "(URL no disponible)" && return
+  [[ "${https_port}" == "443" ]] && echo "https://${dns_name}/" || echo "https://${dns_name}:${https_port}/"
+}
+
+is_running() { local pid; pid="$(get_pid || true)"; [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; }
+
+print_usage() {
+  cat <<EOF
+Uso: ./yt-flow <start|stop|restart|status|logs>
+
+Comandos:
+  start    Arranca la app y publica por Tailscale Serve
+  stop     Detiene SOLO el Serve de esta app y la app local
+  restart  Reinicia todo
+  status   Muestra estado de app y Tailscale Serve
+  logs     Muestra logs en tiempo real
+EOF
+}
+
+ensure_prereqs() {
+  command_exists node || { echo "Error: 'node' no está instalado."; exit 1; }
+  command_exists tailscale || { echo "Error: 'tailscale' no está en PATH."; exit 1; }
+}
+
+start_app() {
+  local target_port="${PORT}" existing_pid
+  is_running && echo "${APP_NAME} ya está en ejecución (PID $(get_pid), puerto $(get_saved_port))." && return
+
+  existing_pid="$(listener_pid_by_port "${target_port}")"
+  if is_our_server_pid "${existing_pid}"; then
+    echo "${APP_NAME} ya estaba activa sin PID guardado (PID ${existing_pid}, puerto ${target_port})."
+    echo "${existing_pid}" >"${PID_FILE}"; echo "${target_port}" >"${PORT_FILE}"; return
+  fi
+
+  if [[ -n "${existing_pid}" ]]; then
+    target_port="$(find_free_port "${target_port}")" || { echo "Error: no encontré puerto libre."; exit 1; }
+    echo "Puerto ${PORT} ocupado. Usando ${target_port}."
+  fi
+
+  echo "Arrancando ${APP_NAME} en puerto ${target_port}..."
+  ( cd "${SCRIPT_DIR}"; nohup env PORT="${target_port}" node server.js >>"${LOG_FILE}" 2>&1 & echo $! >"${PID_FILE}" )
+  sleep 1
+  if ! is_running; then echo "No se pudo arrancar. Revisa logs:"; tail -n 40 "${LOG_FILE}" || true; rm -f "${PID_FILE}"; exit 1; fi
+  echo "${target_port}" >"${PORT_FILE}"
+  echo "App iniciada (PID $(get_pid), puerto ${target_port})."
+}
+
+start_serve() {
+  local target_port desired_https_port active_https_port target_url
+  target_port="$(get_saved_port)"; desired_https_port="$(get_saved_ts_port)"
+  active_https_port="${desired_https_port}"; target_url="http://127.0.0.1:${target_port}"
+
+  if serve_port_in_use "${desired_https_port}"; then
+    if serve_port_maps_to_target "${desired_https_port}" "${target_url}"; then
+      echo "Tailscale Serve ya está activo en HTTPS ${desired_https_port} para esta app."
+    else
+      active_https_port="$(find_free_ts_port "${TS_HTTPS_PORT}")" || { echo "Error: no encontré puerto HTTPS libre."; exit 1; }
+      echo "Puerto HTTPS ${desired_https_port} ocupado. Usando ${active_https_port}."
+      tailscale serve --bg --https="${active_https_port}" "${target_url}" >/dev/null
+    fi
+  else
+    echo "Activando Tailscale Serve (HTTPS ${active_https_port}) -> ${target_url} ..."
+    tailscale serve --bg --https="${active_https_port}" "${target_url}" >/dev/null
+  fi
+
+  echo "${active_https_port}" >"${TS_PORT_FILE}"
+  echo "Serve activo."
+  echo "URL Tailnet: $(build_tailnet_url "${active_https_port}")"
+}
+
+stop_app() {
+  [[ ! -f "${PID_FILE}" ]] && echo "No hay PID guardado. App probablemente detenida." && return
+  local pid; pid="$(get_pid || true)"
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+    echo "Deteniendo app (PID ${pid})..."; kill "${pid}" 2>/dev/null || true; sleep 0.4
+    kill -0 "${pid}" >/dev/null 2>&1 && kill -9 "${pid}" 2>/dev/null || true
+  else echo "PID guardado no está activo."; fi
+  rm -f "${PID_FILE}" "${PORT_FILE}"; echo "App detenida."
+}
+
+stop_serve() {
+  [[ ! -f "${TS_PORT_FILE}" ]] && echo "No hay puerto Serve registrado." && return
+  local https_port; https_port="$(get_saved_ts_port)"
+  echo "Deteniendo Tailscale Serve (HTTPS ${https_port})..."
+  tailscale serve --https="${https_port}" off >/dev/null 2>&1 || true
+  rm -f "${TS_PORT_FILE}"; echo "Serve detenido."
+}
+
+show_status() {
+  echo "== ${APP_NAME} =="
+  is_running && echo "App: RUNNING (PID $(get_pid)) en http://127.0.0.1:$(get_saved_port)" || echo "App: STOPPED"
+  echo; echo "== URL de esta app =="
+  [[ -f "${TS_PORT_FILE}" ]] && echo "Tailnet: $(build_tailnet_url "$(get_saved_ts_port)")" || echo "Tailnet: no registrada"
+  echo; echo "== Tailscale Serve =="; tailscale serve status || true
+}
+
+show_logs() { touch "${LOG_FILE}"; echo "Mostrando logs: ${LOG_FILE}"; tail -n 80 -f "${LOG_FILE}"; }
+
+main() {
+  local action="${1:-}"
+  case "${action}" in
+    start)   ensure_prereqs; start_app; start_serve; echo; show_status ;;
+    stop)    ensure_prereqs; stop_serve; stop_app ;;
+    restart) ensure_prereqs; stop_serve; stop_app; start_app; start_serve; echo; show_status ;;
+    status)  ensure_prereqs; show_status ;;
+    logs)    show_logs ;;
+    *)       print_usage; exit 1 ;;
+  esac
+}
+
+main "$@"

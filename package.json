@@ -1,0 +1,17 @@
+{
+  "name": "yt-player-tailnet",
+  "version": "1.0.0",
+  "description": "YouTube audio player PWA shared over Tailscale.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "flow:start": "./yt-flow start",
+    "flow:stop": "./yt-flow stop",
+    "flow:restart": "./yt-flow restart",
+    "flow:status": "./yt-flow status"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
