@@ -114,10 +114,16 @@ async function _doDownload(videoId, state) {
 
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
-    proc.on('close', (code) => {
-      downloads.delete(videoId);
+    proc.on('close', async (code) => {
       if (code !== 0) {
-        try { fs.unlinkSync(tempPath); } catch {}
+        downloads.delete(videoId);
+        // Limpiar restos parciales
+        try {
+          const files = fs.readdirSync(VIDEOS_DIR);
+          for (const f of files) {
+            if (f.includes('downloading')) fs.unlinkSync(path.join(VIDEOS_DIR, f));
+          }
+        } catch {}
         return reject(new Error(stderr.slice(-200) || `yt-dlp exit ${code}`));
       }
       // Renombrar el resultado a nombre final
@@ -135,6 +141,18 @@ async function _doDownload(videoId, state) {
         }
       } catch {}
 
+      // Remux a fragmented MP4 para reproducción vía MediaSource.
+      // MSE no soporta MP4 tradicional (moov al final), solo fMP4.
+      // Es remux puro, no re-encoding → rápido.
+      if (isVideoReady(videoId)) {
+        try {
+          await remuxToFmp4(filePath);
+        } catch (e) {
+          console.warn(`[remux] fMP4 falló para ${videoId}: ${e.message}. Se sirve MP4 sin fragmentar.`);
+        }
+      }
+
+      downloads.delete(videoId);
       if (isVideoReady(videoId)) {
         resolve(filePath);
       } else {
@@ -149,6 +167,75 @@ async function _doDownload(videoId, state) {
   });
 }
 
+// ── fMP4 remux (para MediaSource) ───────────────────
+function remuxToFmp4(filePath) {
+  return new Promise((resolve, reject) => {
+    const tmpPath = filePath + '.fmp4.tmp';
+    const proc = spawn('ffmpeg', [
+      '-nostdin', '-loglevel', 'error',
+      '-i', filePath,
+      '-c', 'copy',
+      '-movflags', 'empty_moov+frag_keyframe+default_base_moof',
+      '-f', 'mp4',
+      '-y', tmpPath
+    ], { timeout: 300000 });  // 5 min max remux
+
+    let stderr = '';
+    proc.stderr.on('data', c => { stderr += c.toString(); });
+
+    proc.on('close', (code) => {
+      if (code === 0 && fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 0) {
+        try {
+          fs.renameSync(tmpPath, filePath);
+          resolve();
+        } catch (e) { reject(e); }
+      } else {
+        try { fs.unlinkSync(tmpPath); } catch {}
+        reject(new Error(stderr.slice(-200) || `ffmpeg exit ${code}`));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
+// ── ffprobe: detectar codecs para addSourceBuffer ───
+function detectCodecs(filePath) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'stream=codec_name,codec_tag_string,profile,level',
+      '-of', 'json',
+      filePath
+    ], { timeout: 10000 }, (err, stdout) => {
+      if (err) return resolve(null);
+      try {
+        const data = JSON.parse(stdout);
+        const streams = data.streams || [];
+        const v = streams.find(s => s.codec_name && s.codec_name !== 'aac');
+        const a = streams.find(s => s.codec_name === 'aac');
+
+        // Construir strings compatibles con MediaSource.isTypeSupported()
+        // Para H.264: avc1.PPCCLL (hex) donde PP=profile_idc, CC=constraint, LL=level
+        // Para AAC-LC: mp4a.40.2
+        let videoCodec = 'avc1.4d401f';  // fallback: baseline-ish
+        if (v && v.codec_tag_string === 'avc1' && typeof v.profile === 'string') {
+          const profileMap = { 'Baseline': '42', 'Main': '4d', 'High': '64' };
+          const pp = profileMap[v.profile] || '4d';
+          const lvl = v.level ? v.level.toString(16).padStart(2, '0') : '1f';
+          videoCodec = `avc1.${pp}401${lvl[lvl.length - 1] || 'f'}`;
+        }
+        resolve({
+          video: videoCodec,
+          audio: a ? 'mp4a.40.2' : null,
+          combined: a ? `${videoCodec},mp4a.40.2` : videoCodec
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
 const validId = id => /^[a-zA-Z0-9_-]{11}$/.test(id);
 
 // ── API: info ───────────────────────────────────────
@@ -157,7 +244,16 @@ app.get('/api/info/:id', async (req, res) => {
   try {
     const info = await getInfo(req.params.id);
     const cached = isVideoReady(req.params.id);
-    res.json({ ...info, cached });
+
+    let size = 0;
+    let codecs = null;
+    if (cached) {
+      const fp = getVideoPath(req.params.id);
+      try { size = fs.statSync(fp).size; } catch {}
+      codecs = await detectCodecs(fp);
+    }
+
+    res.json({ ...info, cached, size, codecs });
   } catch (e) {
     console.error('[info]', req.params.id, e.message);
     res.status(500).json({ error: e.message });

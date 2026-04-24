@@ -292,6 +292,258 @@ async function startDeviceCache(videoId) {
 }
 
 // ═══════════════════════════════════════════════════════
+// MSE PLAYER (ventana deslizante + cache por chunks)
+// ═══════════════════════════════════════════════════════
+// Reproduce vídeos grandes con MediaSource Extensions:
+// - Carga chunks de 2 MB por byte-range
+// - Mantiene 60 min buffered hacia adelante
+// - Cachea cada chunk en IDB por separado (key: videoId_byteStart)
+// - Si pierde red: reproduce desde chunks cacheados en IDB
+// - Cuando vuelve red: continúa rellenando desde donde se quedó
+
+const MSE_CHUNK_SIZE = 2 * 1024 * 1024;   // 2 MB por chunk
+const MSE_PREFETCH_SECONDS = 60 * 60;     // 60 min adelante
+const MSE_EVICT_BEHIND_SECONDS = 5 * 60;  // guardar últimos 5 min en sourceBuffer
+
+const mse = {
+  videoId: null,
+  info: null,
+  mediaSource: null,
+  sourceBuffer: null,
+  objectUrl: null,
+  appendQueue: [],
+  appending: false,
+  maintainTimer: null,
+  destroyed: false,
+  loadingChunk: false
+};
+
+function supportsMse() {
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  if (!MS) return false;
+  // Verificar soporte de mime/codec
+  return MS.isTypeSupported && MS.isTypeSupported('video/mp4; codecs="avc1.4d401f,mp4a.40.2"');
+}
+
+function destroyMsePlayer() {
+  mse.destroyed = true;
+  if (mse.maintainTimer) { clearTimeout(mse.maintainTimer); mse.maintainTimer = null; }
+  const v = dom.video;
+  v.removeEventListener('timeupdate', maintainBuffer);
+  v.removeEventListener('seeking', maintainBuffer);
+  v.removeEventListener('waiting', maintainBuffer);
+  if (mse.mediaSource && mse.mediaSource.readyState === 'open') {
+    try { mse.mediaSource.endOfStream(); } catch {}
+  }
+  if (mse.objectUrl) { URL.revokeObjectURL(mse.objectUrl); mse.objectUrl = null; }
+  mse.mediaSource = null;
+  mse.sourceBuffer = null;
+  mse.appendQueue = [];
+  mse.appending = false;
+  mse.loadingChunk = false;
+  mse.videoId = null;
+}
+
+async function startMsePlayback(videoId, info) {
+  destroyMsePlayer();
+  if (!info.size || !info.codecs || !info.codecs.combined) {
+    throw new Error('Faltan size o codecs para MSE');
+  }
+
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  const ms = new MS();
+  mse.mediaSource = ms;
+  mse.videoId = videoId;
+  mse.info = info;
+  mse.destroyed = false;
+
+  const url = URL.createObjectURL(ms);
+  mse.objectUrl = url;
+  dom.video.src = url;
+
+  // Para ManagedMediaSource (iOS 17.1+), hay que setear disableRemotePlayback
+  dom.video.disableRemotePlayback = true;
+
+  await new Promise((resolve, reject) => {
+    ms.addEventListener('sourceopen', resolve, { once: true });
+    ms.addEventListener('error', () => reject(new Error('MediaSource error')), { once: true });
+    setTimeout(() => reject(new Error('sourceopen timeout')), 10000);
+  });
+  if (mse.destroyed) return;
+
+  const mime = `video/mp4; codecs="${info.codecs.combined}"`;
+  if (!MS.isTypeSupported(mime)) {
+    throw new Error(`Codec no soportado: ${mime}`);
+  }
+
+  const sb = ms.addSourceBuffer(mime);
+  mse.sourceBuffer = sb;
+  try { ms.duration = info.duration; } catch {}
+  sb.addEventListener('updateend', processAppendQueue);
+  sb.addEventListener('error', (e) => console.warn('sourceBuffer error', e));
+
+  dom.video.addEventListener('timeupdate', maintainBuffer);
+  dom.video.addEventListener('seeking', maintainBuffer);
+  dom.video.addEventListener('waiting', maintainBuffer);
+
+  // Arrancar mantenimiento
+  maintainBuffer();
+}
+
+// ── Append queue (SourceBuffer solo procesa uno a la vez) ──
+function enqueueAppend(data) {
+  mse.appendQueue.push(data);
+  processAppendQueue();
+}
+
+function processAppendQueue() {
+  if (mse.destroyed) return;
+  const sb = mse.sourceBuffer;
+  if (!sb || sb.updating || mse.appendQueue.length === 0) return;
+  const data = mse.appendQueue.shift();
+  try {
+    sb.appendBuffer(data);
+  } catch (e) {
+    if (e.name === 'QuotaExceededError') {
+      // SourceBuffer lleno → evictar rangos antiguos
+      evictSourceBufferBehind().then(() => {
+        mse.appendQueue.unshift(data);
+        processAppendQueue();
+      });
+    } else {
+      console.error('appendBuffer fatal', e);
+    }
+  }
+}
+
+async function evictSourceBufferBehind() {
+  const sb = mse.sourceBuffer;
+  if (!sb || sb.updating) return;
+  const ct = dom.video.currentTime;
+  const cutoff = Math.max(0, ct - MSE_EVICT_BEHIND_SECONDS);
+  if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
+    await new Promise((resolve) => {
+      const onEnd = () => { sb.removeEventListener('updateend', onEnd); resolve(); };
+      sb.addEventListener('updateend', onEnd);
+      try { sb.remove(0, cutoff); } catch { resolve(); }
+    });
+  }
+}
+
+// ── Conversión tiempo ↔ byte ──
+function msTimeToByte(t) {
+  const { info } = mse;
+  return Math.max(0, Math.min(info.size - 1, Math.floor((t / info.duration) * info.size)));
+}
+function msByteToTime(b) {
+  const { info } = mse;
+  return (b / info.size) * info.duration;
+}
+
+// ── Mantener buffer por delante ──
+async function maintainBuffer() {
+  if (mse.destroyed || mse.loadingChunk) return;
+  const { info, sourceBuffer } = mse;
+  if (!sourceBuffer) return;
+
+  const ct = dom.video.currentTime || 0;
+  const targetEnd = Math.min(info.duration, ct + MSE_PREFETCH_SECONDS);
+
+  // Encontrar próximo tiempo que NO está buffered
+  let t = ct;
+  for (let i = 0; i < sourceBuffer.buffered.length; i++) {
+    const s = sourceBuffer.buffered.start(i);
+    const e = sourceBuffer.buffered.end(i);
+    if (s <= t && t < e) t = e;
+  }
+  if (t >= targetEnd) {
+    // Ya tenemos buffered hasta la ventana. Esperar que avance currentTime.
+    mse.maintainTimer = setTimeout(maintainBuffer, 3000);
+    return;
+  }
+  if (t >= info.duration - 0.5) return;  // fin del vídeo
+
+  const byteStart = msTimeToByte(t);
+  // Alinear byteStart a múltiplo de CHUNK_SIZE para máxima cache-hit
+  const alignedStart = Math.floor(byteStart / MSE_CHUNK_SIZE) * MSE_CHUNK_SIZE;
+  const byteEnd = Math.min(alignedStart + MSE_CHUNK_SIZE - 1, info.size - 1);
+
+  mse.loadingChunk = true;
+  try {
+    const data = await loadChunk(alignedStart, byteEnd);
+    if (mse.destroyed || !data) return;
+    enqueueAppend(data);
+    mse.maintainTimer = setTimeout(maintainBuffer, 50);
+  } catch (e) {
+    console.warn(`Chunk load failed: ${e.message}. Retry in 5s.`);
+    setStatus(`Sin conexión. Reintentando...`, '');
+    mse.maintainTimer = setTimeout(maintainBuffer, 5000);
+  } finally {
+    mse.loadingChunk = false;
+  }
+}
+
+// ── Load chunk: IDB cache-first, luego fetch ──
+async function loadChunk(byteStart, byteEnd) {
+  const videoId = mse.videoId;
+  const cached = await idbGet(CHUNKS_STORE, `${videoId}_${byteStart}`);
+  if (cached && cached.data) return cached.data;
+
+  const resp = await fetch(`/api/stream/${videoId}`, {
+    headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
+  });
+  if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+  const data = await resp.arrayBuffer();
+
+  // Guardar en IDB (fire-and-forget para no bloquear playback)
+  saveChunkToIdb(videoId, byteStart, byteEnd, data).catch(() => {});
+  return data;
+}
+
+async function saveChunkToIdb(videoId, byteStart, byteEnd, data) {
+  const record = {
+    id: `${videoId}_${byteStart}`,
+    videoId, byteStart, byteEnd, data,
+    date: Date.now()
+  };
+  try {
+    await idbPut(CHUNKS_STORE, record);
+  } catch (e) {
+    // Cuota llena → evictar chunks viejos y reintentar
+    await evictOldChunks(videoId);
+    try { await idbPut(CHUNKS_STORE, record); } catch {}
+  }
+}
+
+// Borrar chunks más antiguos de otros vídeos (o del mismo si es muy viejo)
+async function evictOldChunks(currentVideoId) {
+  const all = await idbGetAll(CHUNKS_STORE);
+  if (all.length === 0) return;
+  // Prioridad: primero chunks de otros vídeos, ordenados por fecha (más viejos)
+  all.sort((a, b) => {
+    const aOther = a.videoId !== currentVideoId ? 0 : 1;
+    const bOther = b.videoId !== currentVideoId ? 0 : 1;
+    if (aOther !== bOther) return aOther - bOther;
+    return (a.date || 0) - (b.date || 0);
+  });
+  // Borrar los primeros 10 (o hasta 100 MB)
+  let freed = 0;
+  for (let i = 0; i < Math.min(10, all.length); i++) {
+    await idbDelete(CHUNKS_STORE, all[i].id);
+    freed += all[i].data.byteLength || 0;
+    if (freed > 100 * 1024 * 1024) break;
+  }
+}
+
+// Borrar todos los chunks de un vídeo (al quitarlo del historial)
+async function deleteMseChunksForVideo(videoId) {
+  const all = await idbGetAll(CHUNKS_STORE);
+  for (const rec of all) {
+    if (rec.videoId === videoId) await idbDelete(CHUNKS_STORE, rec.id);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // REPRODUCTOR DE VÍDEO
 // ═══════════════════════════════════════════════════════
 
@@ -419,9 +671,10 @@ function toggleFullscreen() {
 //                  totalSize, contentType, date } - descargas en progreso
 
 const DB_NAME = 'yt-video-cache';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const VIDEOS_STORE = 'videos';
 const DOWNLOADS_STORE = 'downloads';
+const CHUNKS_STORE = 'mse_chunks';  // chunks por byte-range para reproducción MSE
 
 // Controlador de descarga actual (para poder cancelar)
 let activeDownload = null; // { videoId, abortController }
@@ -436,6 +689,11 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains(DOWNLOADS_STORE)) {
         db.createObjectStore(DOWNLOADS_STORE, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
+        const store = db.createObjectStore(CHUNKS_STORE, { keyPath: 'id' });
+        store.createIndex('videoId', 'videoId', { unique: false });
+        store.createIndex('date', 'date', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -652,17 +910,33 @@ async function playVideo(videoId, startTime) {
       fetch(`/api/download/${videoId}`).catch(() => {});
     }
 
-    // Si está cacheado en el dispositivo, usar blob URL directamente
-    // (iOS Safari no soporta Range requests desde Service Worker)
-    if (cachedOnDevice) {
-      const blobUrl = await getCachedBlobUrl(videoId);
-      if (blobUrl) {
-        v.src = blobUrl;
+    // ── Estrategia de reproducción ─────────────────
+    // Preferido: MSE (ventana deslizante + cache por chunks en IDB)
+    //   → requiere: MSE soportado + info.codecs del servidor + fMP4 en servidor
+    // Fallback 1: blob URL completo (si estaba ya cacheado entero en IDB por el flujo viejo)
+    // Fallback 2: /api/stream/ directo (streaming simple vía servidor)
+    const canUseMse = supportsMse() && info.cached && info.size && info.codecs && info.codecs.combined;
+    let usingMse = false;
+
+    if (canUseMse) {
+      try {
+        await startMsePlayback(videoId, info);
+        usingMse = true;
+      } catch (e) {
+        console.warn('MSE falló, fallback a blob/stream:', e.message);
+        destroyMsePlayer();
+      }
+    }
+
+    if (!usingMse) {
+      // Destruir cualquier MSE residual
+      destroyMsePlayer();
+      if (cachedOnDevice) {
+        const blobUrl = await getCachedBlobUrl(videoId);
+        v.src = blobUrl || `/api/stream/${videoId}`;
       } else {
         v.src = `/api/stream/${videoId}`;
       }
-    } else {
-      v.src = `/api/stream/${videoId}`;
     }
     setStatus('Cargando vídeo...');
 
@@ -678,7 +952,11 @@ async function playVideo(videoId, startTime) {
     // play() en contexto de gesto — iOS lo permite
     v.play().catch(() => {});
 
-    if (cachedOnDevice) {
+    // ── Estado de cache ──
+    if (usingMse) {
+      dom.cacheStatus.textContent = 'Cache adaptativo (60 min adelante)';
+      dom.cacheStatus.classList.add('active', 'cached');
+    } else if (cachedOnDevice) {
       dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
       dom.cacheStatus.classList.add('active', 'cached');
     } else if (!info.cached) {
@@ -686,7 +964,7 @@ async function playVideo(videoId, startTime) {
       dom.cacheStatus.classList.add('active');
       waitForServerThenCacheOnDevice(videoId);
     } else {
-      // En servidor pero no en móvil, cachear
+      // En servidor pero no en móvil, cachear vía flujo viejo (blob completo)
       dom.cacheStatus.classList.add('active');
       startDeviceCache(videoId);
     }
@@ -862,9 +1140,10 @@ async function removeFromHistory(videoId) {
   clearSavedPosition(videoId);
   localStorage.setItem('yt-history', JSON.stringify(state.history));
 
-  // Borrar también del cache (completo y parcial) para no dejar rémoras
+  // Borrar también del cache (completo, parcial y chunks MSE) para no dejar rémoras
   await idbDelete(VIDEOS_STORE, videoId);
   await idbDelete(DOWNLOADS_STORE, videoId);
+  await deleteMseChunksForVideo(videoId);
 
   renderHistory();
 }
