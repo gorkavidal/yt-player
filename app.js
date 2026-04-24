@@ -304,6 +304,8 @@ async function startDeviceCache(videoId) {
 const MSE_CHUNK_SIZE = 2 * 1024 * 1024;   // 2 MB por chunk
 const MSE_PREFETCH_SECONDS = 60 * 60;     // 60 min adelante
 const MSE_EVICT_BEHIND_SECONDS = 5 * 60;  // guardar últimos 5 min en sourceBuffer
+const MSE_INITIAL_PARALLEL = 4;           // descargas en paralelo al arranque
+const MSE_MAX_INFLIGHT = 2;               // descargas simultáneas en maintain
 
 const mse = {
   videoId: null,
@@ -311,11 +313,12 @@ const mse = {
   mediaSource: null,
   sourceBuffer: null,
   objectUrl: null,
-  appendQueue: [],
-  appending: false,
+  appendQueue: [],          // buffers pendientes de append (ordenados por byteStart)
   maintainTimer: null,
   destroyed: false,
-  loadingChunk: false
+  inflight: 0,              // descargas en curso
+  requested: new Set(),     // byteStart ya en proceso o en cola
+  initialized: false        // true tras precargar los primeros chunks
 };
 
 function supportsMse() {
@@ -339,12 +342,13 @@ function destroyMsePlayer() {
   mse.mediaSource = null;
   mse.sourceBuffer = null;
   mse.appendQueue = [];
-  mse.appending = false;
-  mse.loadingChunk = false;
+  mse.inflight = 0;
+  mse.requested = new Set();
+  mse.initialized = false;
   mse.videoId = null;
 }
 
-async function startMsePlayback(videoId, info) {
+async function startMsePlayback(videoId, info, startTime) {
   destroyMsePlayer();
   if (!info.size || !info.codecs || !info.codecs.combined) {
     throw new Error('Faltan size o codecs para MSE');
@@ -386,28 +390,71 @@ async function startMsePlayback(videoId, info) {
   dom.video.addEventListener('seeking', maintainBuffer);
   dom.video.addEventListener('waiting', maintainBuffer);
 
-  // Arrancar mantenimiento
+  // ── BOOST inicial: paralelizar primeros chunks para arranque rápido ──
+  // Siempre necesitamos el chunk 0 (contiene moov/ftyp).
+  // Si hay startTime, también precargamos la zona de startTime.
+  const initialBytes = [0];
+  if (startTime && startTime > 5) {
+    const startByte = msTimeToByte(startTime);
+    const alignedStart = Math.floor(startByte / MSE_CHUNK_SIZE) * MSE_CHUNK_SIZE;
+    if (alignedStart > 0) initialBytes.push(alignedStart);
+  }
+
+  // Desde cada byte inicial, precargar MSE_INITIAL_PARALLEL chunks contiguos
+  const toPreload = [];
+  for (const base of initialBytes) {
+    for (let i = 0; i < MSE_INITIAL_PARALLEL; i++) {
+      const s = base + i * MSE_CHUNK_SIZE;
+      if (s < info.size && !toPreload.includes(s)) toPreload.push(s);
+    }
+  }
+
+  // Lanzar en paralelo, pero appendear en orden ascendente
+  await Promise.all(toPreload.map(s => prefetchChunk(s)));
+  mse.initialized = true;
   maintainBuffer();
 }
 
-// ── Append queue (SourceBuffer solo procesa uno a la vez) ──
-function enqueueAppend(data) {
-  mse.appendQueue.push(data);
-  processAppendQueue();
+// Descarga un chunk y lo inserta ordenado en appendQueue
+async function prefetchChunk(byteStart) {
+  if (mse.destroyed || mse.requested.has(byteStart)) return;
+  mse.requested.add(byteStart);
+  const byteEnd = Math.min(byteStart + MSE_CHUNK_SIZE - 1, mse.info.size - 1);
+  mse.inflight++;
+  try {
+    const data = await loadChunk(byteStart, byteEnd);
+    if (mse.destroyed || !data) return;
+    insertOrdered({ byteStart, data });
+    processAppendQueue();
+  } catch (e) {
+    mse.requested.delete(byteStart);
+    console.warn(`Chunk ${byteStart} failed: ${e.message}`);
+    throw e;
+  } finally {
+    mse.inflight--;
+  }
 }
 
+function insertOrdered(entry) {
+  const q = mse.appendQueue;
+  let i = 0;
+  while (i < q.length && q[i].byteStart < entry.byteStart) i++;
+  q.splice(i, 0, entry);
+}
+
+// ── Append queue (SourceBuffer procesa uno a la vez; mantenemos orden por byteStart) ──
 function processAppendQueue() {
   if (mse.destroyed) return;
   const sb = mse.sourceBuffer;
   if (!sb || sb.updating || mse.appendQueue.length === 0) return;
-  const data = mse.appendQueue.shift();
+  const entry = mse.appendQueue.shift();
   try {
-    sb.appendBuffer(data);
+    sb.appendBuffer(entry.data);
   } catch (e) {
     if (e.name === 'QuotaExceededError') {
-      // SourceBuffer lleno → evictar rangos antiguos
+      // SourceBuffer lleno → evictar rangos antiguos y reintentar
       evictSourceBufferBehind().then(() => {
-        mse.appendQueue.unshift(data);
+        mse.appendQueue.unshift(entry);
         processAppendQueue();
       });
     } else {
@@ -440,47 +487,47 @@ function msByteToTime(b) {
   return (b / info.size) * info.duration;
 }
 
-// ── Mantener buffer por delante ──
+// ── Mantener buffer por delante (hasta MSE_MAX_INFLIGHT en paralelo) ──
 async function maintainBuffer() {
-  if (mse.destroyed || mse.loadingChunk) return;
+  if (mse.destroyed) return;
   const { info, sourceBuffer } = mse;
-  if (!sourceBuffer) return;
+  if (!sourceBuffer || !mse.initialized) return;
+  if (mse.inflight >= MSE_MAX_INFLIGHT) return;
 
   const ct = dom.video.currentTime || 0;
   const targetEnd = Math.min(info.duration, ct + MSE_PREFETCH_SECONDS);
 
-  // Encontrar próximo tiempo que NO está buffered
+  // Encontrar próximo tiempo que NO está buffered ni en cola
   let t = ct;
   for (let i = 0; i < sourceBuffer.buffered.length; i++) {
     const s = sourceBuffer.buffered.start(i);
     const e = sourceBuffer.buffered.end(i);
     if (s <= t && t < e) t = e;
   }
-  if (t >= targetEnd) {
-    // Ya tenemos buffered hasta la ventana. Esperar que avance currentTime.
+  if (t >= targetEnd || t >= info.duration - 0.5) {
     mse.maintainTimer = setTimeout(maintainBuffer, 3000);
     return;
   }
-  if (t >= info.duration - 0.5) return;  // fin del vídeo
 
-  const byteStart = msTimeToByte(t);
-  // Alinear byteStart a múltiplo de CHUNK_SIZE para máxima cache-hit
-  const alignedStart = Math.floor(byteStart / MSE_CHUNK_SIZE) * MSE_CHUNK_SIZE;
-  const byteEnd = Math.min(alignedStart + MSE_CHUNK_SIZE - 1, info.size - 1);
-
-  mse.loadingChunk = true;
-  try {
-    const data = await loadChunk(alignedStart, byteEnd);
-    if (mse.destroyed || !data) return;
-    enqueueAppend(data);
-    mse.maintainTimer = setTimeout(maintainBuffer, 50);
-  } catch (e) {
-    console.warn(`Chunk load failed: ${e.message}. Retry in 5s.`);
-    setStatus(`Sin conexión. Reintentando...`, '');
-    mse.maintainTimer = setTimeout(maintainBuffer, 5000);
-  } finally {
-    mse.loadingChunk = false;
+  // Saltar byteStarts ya requested/queued
+  let byteStart = msTimeToByte(t);
+  let alignedStart = Math.floor(byteStart / MSE_CHUNK_SIZE) * MSE_CHUNK_SIZE;
+  while (mse.requested.has(alignedStart) && alignedStart < info.size) {
+    alignedStart += MSE_CHUNK_SIZE;
   }
+  if (alignedStart >= info.size) {
+    mse.maintainTimer = setTimeout(maintainBuffer, 3000);
+    return;
+  }
+
+  // Lanzar hasta llenar MSE_MAX_INFLIGHT (no await — queremos concurrencia)
+  prefetchChunk(alignedStart).catch(() => {
+    // Reintentar en 5s si falla (sin conexión, etc.)
+    mse.maintainTimer = setTimeout(maintainBuffer, 5000);
+  });
+
+  // Continuar encolando el siguiente hasta llenar inflight
+  mse.maintainTimer = setTimeout(maintainBuffer, 50);
 }
 
 // ── Load chunk: IDB cache-first, luego fetch ──
@@ -920,7 +967,7 @@ async function playVideo(videoId, startTime) {
 
     if (canUseMse) {
       try {
-        await startMsePlayback(videoId, info);
+        await startMsePlayback(videoId, info, startTime);
         usingMse = true;
       } catch (e) {
         console.warn('MSE falló, fallback a blob/stream:', e.message);
