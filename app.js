@@ -1,10 +1,23 @@
 // ═══════════════════════════════════════════════════════
 // YT Player – Vídeo nativo con cache offline
 //
-// Usa yt-dlp en el servidor para obtener el stream MP4,
+// Usa yt-dlp en el servidor para obtener el MP4,
 // <video> nativo para reproducir, y Service Worker para
-// cachear el vídeo completo y reproducir sin conexión.
+// cachear ventanas de Range requests en el movil.
 // ═══════════════════════════════════════════════════════
+
+const HLS_CACHE_NAME = 'yt-hls-v1';
+
+function loadHistoryFromStorage() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('yt-history') || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(item => item && item.id && item.title);
+  } catch {
+    try { localStorage.removeItem('yt-history'); } catch {}
+    return [];
+  }
+}
 
 // ─── Estado ───
 const state = {
@@ -14,7 +27,7 @@ const state = {
   isSeeking: false,
   hasRetried: false,
   silentAudio: null,
-  history: JSON.parse(localStorage.getItem('yt-history') || '[]'),
+  history: loadHistoryFromStorage(),
   timerEnd: null,
   timerInterval: null,
   positionInterval: null
@@ -34,6 +47,7 @@ function initDOM() {
   dom.title        = $('.player-title');
   dom.author       = $('.player-author');
   dom.cacheStatus  = $('.cache-status');
+  dom.cacheActions = $('.cache-actions');
   dom.progress     = $('.progress-bar');
   dom.timeCur      = $('.time-current');
   dom.timeDur      = $('.time-duration');
@@ -139,7 +153,9 @@ function stopSilentAudio() {
 // Fase 2: SW descarga del servidor al cache del móvil
 let downloadPollInterval = null;
 
-// Polling no bloqueante: sigue el progreso del servidor y luego cachea en el móvil
+// Polling no bloqueante: sigue el progreso del servidor y luego activa
+// la cache de rangos en el movil. Evitamos descargar el video completo
+// como Blob porque en iOS se vuelve fragil con archivos grandes.
 function waitForServerThenCacheOnDevice(videoId) {
   stopDownloadPolling();
   downloadPollInterval = setInterval(async () => {
@@ -149,7 +165,13 @@ function waitForServerThenCacheOnDevice(videoId) {
 
       if (data.status === 'ready') {
         stopDownloadPolling();
-        startDeviceCache(videoId);
+        const infoRes = await fetch(`/api/info/${videoId}`);
+        if (!infoRes.ok) return;
+        const info = await infoRes.json();
+        if (state.videoId !== videoId) return;
+        state.info = info;
+        dom.cacheStatus.textContent = 'Cache movil: preparando ventana...';
+        startRangePrefetch(videoId, info, dom.video.currentTime || 0);
       } else if (data.status === 'downloading') {
         dom.cacheStatus.textContent = `Servidor: ${data.progress}%`;
       }
@@ -164,6 +186,188 @@ function stopDownloadPolling() {
     clearInterval(downloadPollInterval);
     downloadPollInterval = null;
   }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function supportsNativeHls() {
+  const v = dom.video || document.createElement('video');
+  return !!(
+    v.canPlayType('application/vnd.apple.mpegurl') ||
+    v.canPlayType('application/x-mpegURL')
+  );
+}
+
+function hlsPlaylistUrl(videoId) {
+  return `/api/hls/${videoId}/index.m3u8`;
+}
+
+function mediaUrlForVideo(videoId) {
+  return supportsNativeHls() ? hlsPlaylistUrl(videoId) : `/api/stream/${videoId}`;
+}
+
+async function prepareServerVideo(videoId) {
+  await fetch(`/api/prepare/${videoId}`).catch(() => {});
+
+  for (let i = 0; i < 360; i++) {
+    const res = await fetch(`/api/progress/${videoId}`);
+    const data = await res.json();
+
+    if (data.status === 'ready') {
+      setStatus('Listo');
+      return;
+    }
+    if (data.status === 'downloading') {
+      setStatus(`Servidor descargando... ${data.progress || 0}%`);
+    } else if (data.status === 'segmenting') {
+      setStatus('Preparando cache por segmentos...');
+    } else {
+      setStatus('Preparando servidor...');
+      fetch(`/api/prepare/${videoId}`).catch(() => {});
+    }
+    await sleep(1500);
+  }
+
+  throw new Error('El servidor ha tardado demasiado preparando el video');
+}
+
+function getCachedHlsMeta(videoId) {
+  try {
+    return JSON.parse(localStorage.getItem(`yt-hls-cache-${videoId}`) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function setCachedHlsMeta(videoId, meta) {
+  localStorage.setItem(`yt-hls-cache-${videoId}`, JSON.stringify({
+    ...meta,
+    date: Date.now()
+  }));
+}
+
+function removeCachedHlsMeta(videoId) {
+  localStorage.removeItem(`yt-hls-cache-${videoId}`);
+}
+
+function setCacheButtonsDisabled(disabled) {
+  if (!dom.cacheActions) return;
+  dom.cacheActions.querySelectorAll('button').forEach(btn => { btn.disabled = disabled; });
+}
+
+async function cacheHlsForWalk(videoId, minutes) {
+  if (!videoId) return;
+  if (!('caches' in window)) {
+    setStatus('Este navegador no permite cache local', 'error');
+    return;
+  }
+
+  setCacheButtonsDisabled(true);
+  dom.cacheStatus.classList.add('active');
+  dom.cacheStatus.classList.remove('cached');
+  dom.cacheStatus.textContent = 'Preparando cache...';
+
+  try {
+    if ('serviceWorker' in navigator) {
+      await navigator.serviceWorker.ready.catch(() => {});
+    }
+    await prepareServerVideo(videoId);
+    const playlistUrl = new URL(hlsPlaylistUrl(videoId), location.href).toString();
+    const playlistResp = await fetch(playlistUrl, { cache: 'reload' });
+    if (!playlistResp.ok) throw new Error('No se pudo cargar la playlist HLS');
+
+    const playlistText = await playlistResp.clone().text();
+    const segments = parseHlsSegments(playlistText, playlistUrl);
+    const selected = selectSegmentsForMinutes(segments, minutes);
+    if (selected.length === 0) throw new Error('No hay segmentos para guardar');
+    const cache = await caches.open(HLS_CACHE_NAME);
+    await cache.put(playlistUrl, playlistResp);
+
+    for (let i = 0; i < selected.length; i++) {
+      const seg = selected[i];
+      const cached = await cache.match(seg.url);
+      if (!cached) {
+        const resp = await fetch(seg.url);
+        if (!resp.ok) throw new Error(`Segmento no disponible (${resp.status})`);
+        await cache.put(seg.url, resp);
+      }
+
+      const pct = Math.round(((i + 1) / selected.length) * 100);
+      dom.cacheStatus.textContent = `Guardando en movil... ${pct}%`;
+    }
+
+    const cachedMinutes = Math.round(selected.reduce((sum, seg) => sum + seg.duration, 0) / 60);
+    setCachedHlsMeta(videoId, {
+      minutes: minutes === 'all' ? 'all' : cachedMinutes,
+      segments: selected.length
+    });
+    dom.cacheStatus.textContent = minutes === 'all'
+      ? `Guardado completo (${selected.length} segmentos)`
+      : `Guardado ${cachedMinutes} min (${selected.length} segmentos)`;
+    dom.cacheStatus.classList.add('cached');
+    renderHistory();
+  } catch (e) {
+    console.error('Error guardando HLS:', e);
+    dom.cacheStatus.textContent = e.message || 'No se pudo guardar';
+    setStatus(e.message || 'No se pudo guardar', 'error');
+  } finally {
+    setCacheButtonsDisabled(false);
+  }
+}
+
+function parseHlsSegments(playlistText, playlistUrl) {
+  const segments = [];
+  let duration = 10;
+
+  for (const rawLine of playlistText.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF:')) {
+      const value = parseFloat(line.slice(8).split(',')[0]);
+      duration = Number.isFinite(value) ? value : 10;
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    segments.push({
+      url: new URL(line, playlistUrl).toString(),
+      duration
+    });
+    duration = 10;
+  }
+
+  return segments;
+}
+
+function selectSegmentsForMinutes(segments, minutes) {
+  if (minutes === 'all') return segments;
+  const limit = Number(minutes) * 60;
+  let total = 0;
+  const selected = [];
+  for (const seg of segments) {
+    if (total >= limit) break;
+    selected.push(seg);
+    total += seg.duration;
+  }
+  return selected;
+}
+
+async function clearHlsCache(videoId) {
+  if (!videoId || !('caches' in window)) return;
+  const cache = await caches.open(HLS_CACHE_NAME);
+  const keys = await cache.keys();
+  await Promise.all(keys.map(req => {
+    const url = new URL(req.url);
+    return url.pathname.startsWith(`/api/hls/${videoId}/`)
+      ? cache.delete(req)
+      : Promise.resolve(false);
+  }));
+  removeCachedHlsMeta(videoId);
+  dom.cacheStatus.textContent = 'Cache limpiada';
+  dom.cacheStatus.classList.add('active');
+  dom.cacheStatus.classList.remove('cached');
+  renderHistory();
 }
 
 async function startDeviceCache(videoId) {
@@ -547,10 +751,12 @@ async function loadChunk(byteStart, byteEnd) {
   return data;
 }
 
-async function saveChunkToIdb(videoId, byteStart, byteEnd, data) {
+async function saveChunkToIdb(videoId, byteStart, byteEnd, data, totalSize = 0, contentType = 'video/mp4') {
   const record = {
     id: `${videoId}_${byteStart}`,
     videoId, byteStart, byteEnd, data,
+    totalSize,
+    contentType,
     date: Date.now()
   };
   try {
@@ -564,30 +770,160 @@ async function saveChunkToIdb(videoId, byteStart, byteEnd, data) {
 
 // Borrar chunks más antiguos de otros vídeos (o del mismo si es muy viejo)
 async function evictOldChunks(currentVideoId) {
-  const all = await idbGetAll(CHUNKS_STORE);
-  if (all.length === 0) return;
-  // Prioridad: primero chunks de otros vídeos, ordenados por fecha (más viejos)
-  all.sort((a, b) => {
-    const aOther = a.videoId !== currentVideoId ? 0 : 1;
-    const bOther = b.videoId !== currentVideoId ? 0 : 1;
-    if (aOther !== bOther) return aOther - bOther;
-    return (a.date || 0) - (b.date || 0);
-  });
-  // Borrar los primeros 10 (o hasta 100 MB)
-  let freed = 0;
-  for (let i = 0; i < Math.min(10, all.length); i++) {
-    await idbDelete(CHUNKS_STORE, all[i].id);
-    freed += all[i].data.byteLength || 0;
-    if (freed > 100 * 1024 * 1024) break;
+  const deletedOther = await idbDeleteOldChunkKeys(currentVideoId, false, 20);
+  if (deletedOther < 20) {
+    await idbDeleteOldChunkKeys(currentVideoId, true, 20 - deletedOther);
   }
 }
 
 // Borrar todos los chunks de un vídeo (al quitarlo del historial)
 async function deleteMseChunksForVideo(videoId) {
-  const all = await idbGetAll(CHUNKS_STORE);
-  for (const rec of all) {
-    if (rec.videoId === videoId) await idbDelete(CHUNKS_STORE, rec.id);
+  await idbDeleteByIndex(CHUNKS_STORE, 'videoId', videoId);
+}
+
+// ═══════════════════════════════════════════════════════
+// CACHE NATIVA POR RANGOS
+// ═══════════════════════════════════════════════════════
+// El <video> nativo es quien reproduce. El Service Worker intercepta
+// sus Range requests y guarda chunks en IndexedDB. Desde aqui solo
+// precalentamos una ventana pequena por delante sin tocar MediaSource.
+
+const RANGE_CACHE_CHUNK_SIZE = 2 * 1024 * 1024;
+const RANGE_CACHE_WINDOW_SECONDS = 20 * 60;
+const RANGE_CACHE_MAX_CHUNKS_PER_TICK = 3;
+const RANGE_CACHE_TICK_MS = 5000;
+
+const rangeCache = {
+  videoId: null,
+  info: null,
+  timer: null,
+  abortController: null,
+  queued: new Set(),
+  running: false
+};
+
+function stopRangePrefetch() {
+  if (rangeCache.timer) {
+    clearInterval(rangeCache.timer);
+    rangeCache.timer = null;
   }
+  if (rangeCache.abortController) {
+    rangeCache.abortController.abort();
+    rangeCache.abortController = null;
+  }
+  rangeCache.videoId = null;
+  rangeCache.info = null;
+  rangeCache.queued = new Set();
+  rangeCache.running = false;
+}
+
+function rangeTimeToByte(info, time) {
+  if (!info || !info.size || !info.duration) return 0;
+  const ratio = Math.max(0, Math.min(1, time / info.duration));
+  return Math.floor(ratio * (info.size - 1));
+}
+
+function rangeAlignedByte(byteStart) {
+  return Math.floor(byteStart / RANGE_CACHE_CHUNK_SIZE) * RANGE_CACHE_CHUNK_SIZE;
+}
+
+function startRangePrefetch(videoId, info, startTime = 0) {
+  stopRangePrefetch();
+  if (!info || !info.size || !info.duration) return;
+
+  rangeCache.videoId = videoId;
+  rangeCache.info = info;
+  rangeCache.abortController = new AbortController();
+
+  warmRangeCache(startTime).catch(() => {});
+  rangeCache.timer = setInterval(() => {
+    warmRangeCache().catch(() => {});
+  }, RANGE_CACHE_TICK_MS);
+}
+
+async function warmRangeCache(preferredTime) {
+  if (rangeCache.running || !rangeCache.videoId || !rangeCache.info) return;
+  rangeCache.running = true;
+
+  const { videoId, info, abortController } = rangeCache;
+  const currentTime = typeof preferredTime === 'number'
+    ? preferredTime
+    : (dom.video.currentTime || 0);
+  const fromByte = rangeAlignedByte(rangeTimeToByte(info, currentTime));
+  const toByte = Math.min(
+    info.size - 1,
+    rangeTimeToByte(info, currentTime + RANGE_CACHE_WINDOW_SECONDS)
+  );
+
+  const candidates = [0];
+  for (let b = fromByte; b <= toByte; b += RANGE_CACHE_CHUNK_SIZE) {
+    candidates.push(b);
+  }
+
+  let fetched = 0;
+  try {
+    for (const byteStart of candidates) {
+      if (abortController.signal.aborted) break;
+      if (rangeCache.queued.has(byteStart)) continue;
+      rangeCache.queued.add(byteStart);
+
+      let didFetch = false;
+      try {
+        didFetch = await prefetchRangeChunk(videoId, info, byteStart, abortController.signal);
+      } catch (e) {
+        rangeCache.queued.delete(byteStart);
+        throw e;
+      }
+      if (didFetch) fetched++;
+      if (fetched >= RANGE_CACHE_MAX_CHUNKS_PER_TICK) break;
+    }
+
+    if (state.videoId === videoId) {
+      const stats = await getRangeChunkStats(videoId);
+      if (stats.count > 0 && !dom.cacheStatus.classList.contains('cached')) {
+        dom.cacheStatus.textContent = `Cache movil: ${stats.count} bloques`;
+        dom.cacheStatus.classList.add('active');
+      }
+      renderHistory();
+    }
+  } finally {
+    rangeCache.running = false;
+  }
+}
+
+async function prefetchRangeChunk(videoId, info, byteStart, signal) {
+  const byteEnd = Math.min(byteStart + RANGE_CACHE_CHUNK_SIZE - 1, info.size - 1);
+  const cached = await idbGet(CHUNKS_STORE, `${videoId}_${byteStart}`);
+  if (cached && cached.data && cached.totalSize) return false;
+
+  const resp = await fetch(`/api/stream/${videoId}`, {
+    headers: { Range: `bytes=${byteStart}-${byteEnd}` },
+    signal
+  });
+  if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+
+  const data = await resp.arrayBuffer();
+  const totalSize = readTotalSize(resp.headers) || info.size;
+  const contentType = resp.headers.get('Content-Type') || 'video/mp4';
+  await saveChunkToIdb(videoId, byteStart, byteEnd, data, totalSize, contentType);
+  return true;
+}
+
+function readTotalSize(headers) {
+  const contentRange = headers.get('Content-Range');
+  if (!contentRange) return 0;
+  const match = contentRange.match(/\/(\d+)$/);
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+async function hasRangeCache(videoId) {
+  const count = await idbCountByIndex(CHUNKS_STORE, 'videoId', videoId);
+  return count > 0;
+}
+
+async function getRangeChunkStats(videoId) {
+  const count = await idbCountByIndex(CHUNKS_STORE, 'videoId', videoId);
+  return { count };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -718,10 +1054,10 @@ function toggleFullscreen() {
 //                  totalSize, contentType, date } - descargas en progreso
 
 const DB_NAME = 'yt-video-cache';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const VIDEOS_STORE = 'videos';
 const DOWNLOADS_STORE = 'downloads';
-const CHUNKS_STORE = 'mse_chunks';  // chunks por byte-range para reproducción MSE
+const CHUNKS_STORE = 'mse_chunks';  // nombre legacy; ahora guarda chunks HTTP Range
 
 // Controlador de descarga actual (para poder cancelar)
 let activeDownload = null; // { videoId, abortController }
@@ -737,10 +1073,17 @@ function openDB() {
       if (!db.objectStoreNames.contains(DOWNLOADS_STORE)) {
         db.createObjectStore(DOWNLOADS_STORE, { keyPath: 'id' });
       }
+      let chunkStore = null;
       if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
-        const store = db.createObjectStore(CHUNKS_STORE, { keyPath: 'id' });
-        store.createIndex('videoId', 'videoId', { unique: false });
-        store.createIndex('date', 'date', { unique: false });
+        chunkStore = db.createObjectStore(CHUNKS_STORE, { keyPath: 'id' });
+      } else {
+        chunkStore = req.transaction.objectStore(CHUNKS_STORE);
+      }
+      if (!chunkStore.indexNames.contains('videoId')) {
+        chunkStore.createIndex('videoId', 'videoId', { unique: false });
+      }
+      if (!chunkStore.indexNames.contains('date')) {
+        chunkStore.createIndex('date', 'date', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -785,6 +1128,20 @@ function idbCount(storeName, key) {
   })).catch(() => 0);
 }
 
+function idbCountByIndex(storeName, indexName, key) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    if (!store.indexNames.contains(indexName)) {
+      resolve(0);
+      return;
+    }
+    const req = store.index(indexName).count(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(0);
+  })).catch(() => 0);
+}
+
 function idbGetAll(storeName) {
   return openDB().then(db => new Promise((resolve) => {
     const tx = db.transaction(storeName, 'readonly');
@@ -792,6 +1149,57 @@ function idbGetAll(storeName) {
     req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => resolve([]);
   })).catch(() => []);
+}
+
+function idbDeleteByIndex(storeName, indexName, key) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    if (!store.indexNames.contains(indexName)) {
+      resolve();
+      return;
+    }
+
+    const req = store.index(indexName).openKeyCursor(IDBKeyRange.only(key));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      store.delete(cursor.primaryKey);
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+    tx.onabort = () => resolve();
+  })).catch(() => {});
+}
+
+function idbDeleteOldChunkKeys(currentVideoId, includeCurrent, limit) {
+  return openDB().then(db => new Promise((resolve) => {
+    const tx = db.transaction(CHUNKS_STORE, 'readwrite');
+    const store = tx.objectStore(CHUNKS_STORE);
+    if (!store.indexNames.contains('date') || limit <= 0) {
+      resolve(0);
+      return;
+    }
+
+    let deleted = 0;
+    const req = store.index('date').openKeyCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor || deleted >= limit) return;
+
+      const key = String(cursor.primaryKey || '');
+      const isCurrent = key.startsWith(`${currentVideoId}_`);
+      if ((includeCurrent && isCurrent) || (!includeCurrent && !isCurrent)) {
+        store.delete(cursor.primaryKey);
+        deleted++;
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve(deleted);
+    tx.onerror = () => resolve(deleted);
+    tx.onabort = () => resolve(deleted);
+  })).catch(() => 0);
 }
 
 async function isVideoCachedOnDevice(videoId) {
@@ -814,6 +1222,11 @@ async function getCachedBlobUrl(videoId) {
 
 async function getPartialDownload(videoId) {
   return idbGet(DOWNLOADS_STORE, videoId);
+}
+
+async function hasPartialDownload(videoId) {
+  const count = await idbCount(DOWNLOADS_STORE, videoId);
+  return count > 0;
 }
 
 async function savePartialDownload(videoId, chunks, receivedBytes, totalSize, contentType) {
@@ -880,11 +1293,8 @@ async function evictOldest(excludeId) {
 async function deleteCachedVideo(videoId) {
   await idbDelete(VIDEOS_STORE, videoId);
   await idbDelete(DOWNLOADS_STORE, videoId);
-  renderHistory();
-}
-
-async function deleteCachedVideo(videoId) {
-  await deleteCachedVideoFromDB(videoId);
+  await deleteMseChunksForVideo(videoId);
+  await clearHlsCache(videoId);
   renderHistory();
 }
 
@@ -895,6 +1305,8 @@ async function deleteCachedVideo(videoId) {
 async function playVideo(videoId, startTime) {
   setButtonLoading(true);
   setStatus('Obteniendo vídeo...');
+  stopRangePrefetch();
+  destroyMsePlayer();
   state.videoId = videoId;
   state.hasRetried = false;
   dom.resume.classList.remove('active');
@@ -911,30 +1323,56 @@ async function playVideo(videoId, startTime) {
   startSilentAudio();
 
   try {
-    // Intentar obtener info del servidor, pero si estamos offline
-    // usar los datos del historial local
     let info = null;
-    const cachedOnDevice = await isVideoCachedOnDevice(videoId);
+    const hlsMeta = getCachedHlsMeta(videoId);
+    const histEntry = state.history.find(h => h.id === videoId);
+    const fullyCached = !!(hlsMeta && (hlsMeta.minutes === 'all' || hlsMeta.segments > 0));
+    let serverAvailable = false;
 
+    // Fetch info con timeout corto (3s). Si está cacheado completo,
+    // tolerancia aún menor: no queremos bloquearnos esperando.
     try {
-      const res = await fetch(`/api/info/${videoId}`);
-      if (res.ok) info = await res.json();
+      const timeoutMs = fullyCached ? 1500 : 5000;
+      const res = await fetch(`/api/info/${videoId}`, {
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      if (res.ok) {
+        info = await res.json();
+        // Si el SW devuelve cache mientras el server no responde,
+        // el response sigue siendo ok=true → necesitamos otra señal.
+        // Marcamos serverAvailable solo si el header indica fresh fetch.
+        serverAvailable = !res.headers.get('X-From-Cache');
+      }
     } catch {}
 
     if (!info) {
-      // Offline — buscar en historial local
-      const histEntry = state.history.find(h => h.id === videoId);
-      if (histEntry && cachedOnDevice) {
+      if (histEntry && fullyCached) {
         info = {
           title: histEntry.title,
           author: histEntry.author,
-          duration: 0,
+          duration: histEntry.duration || 0,
           thumb: histEntry.thumb,
-          cached: true
+          hlsCached: true,
+          size: histEntry.size || 0
         };
       } else {
         throw new Error('Sin conexión y vídeo no disponible');
       }
+    }
+
+    // Solo preparamos en servidor si NO está cacheado completo en móvil.
+    // Si fullyCached, podemos arrancar instantáneamente desde la cache HLS
+    // del Service Worker sin tocar el servidor.
+    if (!fullyCached && serverAvailable) {
+      await prepareServerVideo(videoId);
+      try {
+        const fresh = await fetch(`/api/info/${videoId}`, {
+          signal: AbortSignal.timeout(5000)
+        });
+        if (fresh.ok) info = await fresh.json();
+      } catch {}
+    } else if (!fullyCached && !serverAvailable) {
+      throw new Error('Este vídeo no está guardado en el móvil y no hay servidor');
     }
 
     state.info = info;
@@ -952,39 +1390,8 @@ async function playVideo(videoId, startTime) {
     const v = dom.video;
     v.poster = info.thumb;
 
-    if (!info.cached && !cachedOnDevice) {
-      // Pedir descarga al servidor en background
-      fetch(`/api/download/${videoId}`).catch(() => {});
-    }
-
-    // ── Estrategia de reproducción ─────────────────
-    // Preferido: MSE (ventana deslizante + cache por chunks en IDB)
-    //   → requiere: MSE soportado + info.codecs del servidor + fMP4 en servidor
-    // Fallback 1: blob URL completo (si estaba ya cacheado entero en IDB por el flujo viejo)
-    // Fallback 2: /api/stream/ directo (streaming simple vía servidor)
-    const canUseMse = supportsMse() && info.cached && info.size && info.codecs && info.codecs.combined;
-    let usingMse = false;
-
-    if (canUseMse) {
-      try {
-        await startMsePlayback(videoId, info, startTime);
-        usingMse = true;
-      } catch (e) {
-        console.warn('MSE falló, fallback a blob/stream:', e.message);
-        destroyMsePlayer();
-      }
-    }
-
-    if (!usingMse) {
-      // Destruir cualquier MSE residual
-      destroyMsePlayer();
-      if (cachedOnDevice) {
-        const blobUrl = await getCachedBlobUrl(videoId);
-        v.src = blobUrl || `/api/stream/${videoId}`;
-      } else {
-        v.src = `/api/stream/${videoId}`;
-      }
-    }
+    v.src = mediaUrlForVideo(videoId);
+    v.load();
     setStatus('Cargando vídeo...');
 
     if (startTime && startTime > 0) {
@@ -999,25 +1406,20 @@ async function playVideo(videoId, startTime) {
     // play() en contexto de gesto — iOS lo permite
     v.play().catch(() => {});
 
-    // ── Estado de cache ──
-    if (usingMse) {
-      dom.cacheStatus.textContent = 'Cache adaptativo (60 min adelante)';
+    const freshHlsMeta = getCachedHlsMeta(videoId);
+    if (freshHlsMeta) {
+      dom.cacheStatus.textContent = freshHlsMeta.minutes === 'all'
+        ? `Guardado completo (${freshHlsMeta.segments} segmentos)`
+        : `Guardado ${freshHlsMeta.minutes} min (${freshHlsMeta.segments} segmentos)`;
       dom.cacheStatus.classList.add('active', 'cached');
-    } else if (cachedOnDevice) {
-      dom.cacheStatus.textContent = 'Guardado en móvil (offline)';
-      dom.cacheStatus.classList.add('active', 'cached');
-    } else if (!info.cached) {
-      dom.cacheStatus.textContent = 'Servidor descargando...';
-      dom.cacheStatus.classList.add('active');
-      waitForServerThenCacheOnDevice(videoId);
     } else {
-      // En servidor pero no en móvil, cachear vía flujo viejo (blob completo)
       dom.cacheStatus.classList.add('active');
-      startDeviceCache(videoId);
+      dom.cacheStatus.classList.remove('cached');
+      dom.cacheStatus.textContent = 'Servidor listo. Guarda 30m, 1h o todo antes de salir.';
     }
 
     setupMediaSession(info);
-    addToHistory(videoId, info.title, info.author);
+    addToHistory(videoId, info.title, info.author, info);
   } catch (err) {
     console.error('Error:', err);
     setStatus(err.message || 'Error al cargar', 'error');
@@ -1167,10 +1569,16 @@ function updateMediaSessionState(s) {
 // HISTORIAL
 // ═══════════════════════════════════════════════════════
 
-function addToHistory(videoId, title, author) {
+function addToHistory(videoId, title, author, meta = {}) {
   state.history = state.history.filter(h => h.id !== videoId);
-  state.history.unshift({ id: videoId, title, author,
-    thumb: `https://i.ytimg.com/vi/${videoId}/default.jpg` });
+  state.history.unshift({
+    id: videoId,
+    title,
+    author,
+    thumb: meta.thumb || `https://i.ytimg.com/vi/${videoId}/default.jpg`,
+    duration: meta.duration || 0,
+    size: meta.size || 0
+  });
   if (state.history.length > 30) state.history.pop();
   localStorage.setItem('yt-history', JSON.stringify(state.history));
   renderHistory();
@@ -1191,6 +1599,16 @@ async function removeFromHistory(videoId) {
   await idbDelete(VIDEOS_STORE, videoId);
   await idbDelete(DOWNLOADS_STORE, videoId);
   await deleteMseChunksForVideo(videoId);
+  await clearHlsCache(videoId);
+
+  // Limpiar también la respuesta cacheada de /api/info/:id por el SW
+  if ('caches' in window) {
+    try {
+      const infoCache = await caches.open('yt-info-v1');
+      const infoUrl = new URL(`/api/info/${videoId}`, location.href).toString();
+      await infoCache.delete(infoUrl);
+    } catch {}
+  }
 
   renderHistory();
 }
@@ -1207,14 +1625,17 @@ async function renderHistory() {
 
   // Comprobar estado de cache (completo / parcial) de cada vídeo
   const cacheChecks = await Promise.all(state.history.map(async h => {
+    const hls = getCachedHlsMeta(h.id);
+    if (hls) return { hls };
     const cached = await isVideoCachedOnDevice(h.id);
     if (cached) return { complete: true };
-    const partial = await getPartialDownload(h.id);
-    if (partial && partial.totalSize > 0) {
-      return {
-        partial: true,
-        pct: Math.floor((partial.receivedBytes / partial.totalSize) * 100)
-      };
+    const partial = await hasPartialDownload(h.id);
+    if (partial) {
+      return { partial: true };
+    }
+    const rangeStats = await getRangeChunkStats(h.id);
+    if (rangeStats.count > 0) {
+      return { range: true, count: rangeStats.count };
     }
     return {};
   }));
@@ -1225,10 +1646,15 @@ async function renderHistory() {
       ? `<span class="history-badge">${formatTime(saved.time)}</span>` : '';
     const state = cacheChecks[i];
     let cacheBadge = '';
-    if (state.complete) {
-      cacheBadge = `<span class="cache-badge" data-uncache="${h.id}">offline ✕</span>`;
+    if (state.hls) {
+      const label = state.hls.minutes === 'all' ? 'offline' : `${state.hls.minutes}m`;
+      cacheBadge = `<span class="cache-badge" data-uncache="${h.id}">${label} ✕</span>`;
+    } else if (state.complete) {
+      cacheBadge = `<span class="cache-badge" data-uncache="${h.id}">antigua ✕</span>`;
     } else if (state.partial) {
-      cacheBadge = `<span class="cache-badge partial" data-uncache="${h.id}">${state.pct}% ✕</span>`;
+      cacheBadge = `<span class="cache-badge partial" data-uncache="${h.id}">parcial ✕</span>`;
+    } else if (state.range) {
+      cacheBadge = `<span class="cache-badge partial" data-uncache="${h.id}">${state.count} bloques ✕</span>`;
     }
     return `
       <div class="history-item" data-id="${h.id}">
@@ -1314,6 +1740,16 @@ function init() {
   dom.ctrlPrev.addEventListener('click', () => playPrevFromHistory());
   dom.ctrlNext.addEventListener('click', () => playNextFromHistory());
   dom.ctrlFs.addEventListener('click', toggleFullscreen);
+
+  dom.cacheActions.addEventListener('click', e => {
+    const cacheBtn = e.target.closest('[data-cache-minutes]');
+    if (cacheBtn) {
+      cacheHlsForWalk(state.videoId, cacheBtn.dataset.cacheMinutes);
+      return;
+    }
+    const clearBtn = e.target.closest('[data-cache-clear]');
+    if (clearBtn) clearHlsCache(state.videoId);
+  });
 
   // Progress bar
   dom.progress.addEventListener('input', () => {
